@@ -5,7 +5,9 @@ import tempfile
 import time
 import uuid
 import asyncio
+import threading
 from pathlib import Path
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ================== الحالة في الذاكرة ==================
 authenticated_users = set()
-pending_downloads = {}   # {short_id: {"url":..., "info":..., "user_id":..., "chat_id":..., "message_id":...}}
+pending_downloads = {}   # {short_id: {...}}
 cancel_flags = {}        # {user_id: True/False}
 
 
@@ -68,6 +70,10 @@ def upload_to_drive(file_path: str) -> dict:
 def human_size(bytes_size):
     if not bytes_size:
         return "?"
+    try:
+        bytes_size = float(bytes_size)
+    except Exception:
+        return "?"
     for unit in ["B", "KB", "MB", "GB"]:
         if bytes_size < 1024:
             return f"{bytes_size:.1f} {unit}"
@@ -76,6 +82,8 @@ def human_size(bytes_size):
 
 
 def human_time(seconds):
+    if not seconds:
+        return "?"
     if seconds < 60:
         return f"{int(seconds)} ث"
     m, s = divmod(int(seconds), 60)
@@ -87,7 +95,6 @@ def human_time(seconds):
 
 # ================== جلب معلومات الرابط ==================
 def fetch_url_info(url: str) -> dict:
-    """يجلب معلومات الرابط بدون تحميل"""
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -113,7 +120,6 @@ def fetch_url_info(url: str) -> dict:
 
 
 def build_quality_keyboard(short_id: str, formats: list) -> InlineKeyboardMarkup:
-    """يبني أزرار الجودات المتاحة"""
     available = set()
     for f in formats:
         if f.get("vcodec") == "none":
@@ -146,12 +152,10 @@ def build_quality_keyboard(short_id: str, formats: list) -> InlineKeyboardMarkup
     if row:
         buttons.append(row)
 
-    # زر MP3
     buttons.append([InlineKeyboardButton(
         "🎵 تحميل صوت MP3",
         callback_data=f"dl|{short_id}|mp3"
     )])
-    # زر إلغاء
     buttons.append([InlineKeyboardButton(
         "❌ إلغاء",
         callback_data=f"cancel|{short_id}"
@@ -162,7 +166,6 @@ def build_quality_keyboard(short_id: str, formats: list) -> InlineKeyboardMarkup
 
 # ================== التحميل بـ yt-dlp ==================
 def download_video(url: str, out_dir: str, quality: str, progress_cb=None, cancel_check=None) -> str:
-    """تحميل فيديو/صوت بجودة محددة"""
     if quality == "mp3":
         fmt = "bestaudio/best"
         postprocessors = [{
@@ -275,7 +278,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # التحقق
     if user_id not in authenticated_users:
         text = (update.message.text or "").strip()
         if text == BOT_PASSWORD:
@@ -288,13 +290,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ كلمة سر خاطئة.")
         return
 
-    # ملف من تلجرام
     if update.message.document or update.message.video or update.message.audio:
         file_obj = update.message.document or update.message.video or update.message.audio
         await handle_telegram_file(update, context, file_obj)
         return
 
-    # رابط
     text = (update.message.text or "").strip()
     if text.startswith("http://") or text.startswith("https://"):
         await handle_link(update, context, text)
@@ -308,19 +308,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
     info = fetch_url_info(url)
 
     if not info.get("is_video"):
-        # رابط غير معروف لـ yt-dlp → حمّل مباشرة
         await msg.edit_text("📥 رابط مباشر — جارٍ التحميل...")
-        await do_download(
-            update, context, msg, url, quality=None, info=None
-        )
+        await do_download(update, context, msg, url, quality=None, info=None)
         return
 
-    # فيديو → اعرض المعلومات والأزرار
     title = info["title"][:80]
     duration = human_time(info["duration"]) if info.get("duration") else "?"
     uploader = info.get("uploader") or "?"
 
-    # نُنشئ ID قصير لهذا التحميل
     short_id = uuid.uuid4().hex[:10]
     pending_downloads[short_id] = {
         "url": url,
@@ -371,16 +366,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📥 جارٍ التحميل...")
         await do_download(
             update, context,
-            query.message,  # نستخدم نفس الرسالة
+            query.message,
             pending["url"],
             quality=quality,
-            info=pending["info"],
-            edit_via_query=True
+            info=pending["info"]
         )
 
 
 # ================== التحميل الرئيسي ==================
-async def do_download(update, context, msg, url, quality, info, edit_via_query=False):
+async def do_download(update, context, msg, url, quality, info):
     user_id = update.effective_user.id
     cancel_flags[user_id] = False
     start_time = time.time()
@@ -411,7 +405,6 @@ async def do_download(update, context, msg, url, quality, info, edit_via_query=F
                     )
                 else:
                     text = f"{prefix}\n\n💾 {human_size(downloaded)}"
-                # جدولة التعديل (لا ننتظر)
                 asyncio.create_task(safe_edit(msg, text))
             except Exception as e:
                 logger.warning(f"progress edit failed: {e}")
@@ -422,7 +415,6 @@ async def do_download(update, context, msg, url, quality, info, edit_via_query=F
             file_path = None
 
             if info and info.get("is_video") and quality:
-                # yt-dlp مع الجودة المختارة
                 try:
                     file_path = download_video(
                         url, tmp_dir, quality,
@@ -435,7 +427,6 @@ async def do_download(update, context, msg, url, quality, info, edit_via_query=F
                         return
                     raise
             else:
-                # fallback: جرب yt-dlp best ثم direct
                 try:
                     file_path = download_video(
                         url, tmp_dir, "720",
@@ -521,8 +512,28 @@ async def handle_telegram_file(update, context, file_obj):
         await msg.edit_text(f"❌ فشل:\n`{str(e)[:300]}`", parse_mode="Markdown")
 
 
+# ================== سيرفر HTTP للحفاظ على البوت مستيقظاً ==================
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+@flask_app.route("/health")
+def health():
+    return "DriveSaverBot is alive ✅", 200
+
+
+def run_health_server():
+    """يشغّل سيرفر HTTP صغير على المنفذ الذي يحدده Render"""
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
 # ================== نقطة البداية ==================
 def main():
+    # شغّل سيرفر الصحة في Thread منفصل
+    threading.Thread(target=run_health_server, daemon=True).start()
+    logger.info("🌐 Health server started")
+
     logger.info("🚀 Starting DriveSaverBot...")
     app = Application.builder().token(BOT_TOKEN).build()
 
