@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -110,6 +111,19 @@ def is_rate_limit_error(exc):
     return "429" in text or "too many requests" in text or "google.com/sorry" in text
 
 
+def is_likely_direct_file_url(url):
+    path = urlparse(url).path.lower()
+    direct_exts = {
+        ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2",
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".txt", ".csv", ".json", ".xml", ".apk", ".epub",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+        ".mp3", ".m4a", ".wav", ".flac", ".ogg",
+        ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+    }
+    return any(path.endswith(ext) for ext in direct_exts)
+
+
 def ytdlp_opts(extra=None):
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
     if extra:
@@ -118,17 +132,24 @@ def ytdlp_opts(extra=None):
 
 
 def fetch_url_info(url):
+    if is_likely_direct_file_url(url):
+        return {"is_video": False, "url": url, "direct_file": True}
     try:
         with yt_dlp.YoutubeDL(ytdlp_opts({"skip_download": True})) as ydl:
             i = ydl.extract_info(url, download=False)
+            formats = i.get("formats", []) or []
+            has_video = any(
+                f.get("vcodec") not in (None, "none")
+                for f in formats
+            )
             return {
                 "title": i.get("title", "بدون عنوان"),
                 "duration": i.get("duration"),
                 "uploader": i.get("uploader") or i.get("channel"),
                 "thumbnail": i.get("thumbnail"),
-                "formats": i.get("formats", []),
+                "formats": formats,
                 "webpage_url": i.get("webpage_url", url),
-                "is_video": True,
+                "is_video": has_video,
                 "extractor": i.get("extractor_key", ""),
             }
     except Exception as e:
@@ -199,7 +220,7 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
 
 
 def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
-    filename = url.split("/")[-1].split("?")[0] or "downloaded_file"
+    filename = urlparse(url).path.rsplit("/", 1)[-1] or "downloaded_file"
     filename = "".join(c for c in filename if c.isalnum() or c in "._- ") or "downloaded_file"
     fp = os.path.join(out_dir, filename)
     with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "Mozilla/5.0"}) as r:
@@ -228,6 +249,8 @@ async def youtube_gate():
 
 
 async def fetch_url_info_safe(url):
+    if is_likely_direct_file_url(url):
+        return await asyncio.to_thread(fetch_url_info, url)
     attempts = YOUTUBE_RETRIES + 1 if is_youtube_url(url) else 1
     last_error = None
     for attempt in range(attempts):
@@ -371,7 +394,10 @@ async def do_download(update, context, msg, url, quality, info):
             try:
                 if is_youtube_url(url):
                     await youtube_gate()
-                file_path = await asyncio.to_thread(download_video, url, tmp, quality or "720", progress, cancelled)
+                if info and info.get("is_video"):
+                    file_path = await asyncio.to_thread(download_video, url, tmp, quality or "720", progress, cancelled)
+                else:
+                    file_path = await asyncio.to_thread(download_direct, url, tmp, progress, cancelled)
             except Exception as e:
                 if "__CANCELLED__" in str(e):
                     await msg.edit_text("🛑 تم الإلغاء.")
@@ -381,8 +407,8 @@ async def do_download(update, context, msg, url, quality, info):
                         await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429).\n\nلن نكرر الطلبات بسرعة. جرّب لاحقاً.")
                         return
                     raise
-                logger.warning(f"yt-dlp failed: {e}, trying direct")
-                file_path = await asyncio.to_thread(download_direct, url, tmp, progress, cancelled)
+                logger.warning(f"direct download failed: {e}")
+                raise
             if not file_path or not os.path.exists(file_path):
                 raise Exception("لم يتم إنشاء أي ملف")
             size = os.path.getsize(file_path)
@@ -454,7 +480,6 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    logger.info("✅ Bot running")
     app.run_polling(drop_pending_updates=True)
 
 
