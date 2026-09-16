@@ -7,7 +7,6 @@ on:
 
 jobs:
   patch:
-    if: github.actor == 'Hus-GPT'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -125,18 +124,6 @@ async def handle_link(update, context, url):
               raise SystemExit('cancelled block not found')
           s = s.replace(old, new)
 
-          old = '''async def handle_telegram_file(update, context, file_obj):
-    file_size = getattr(file_obj, "file_size", None) or 0
-    if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
-'''
-          new = '''async def handle_telegram_file(update, context, file_obj):
-    file_size = getattr(file_obj, "file_size", None) or 0
-    if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
-'''
-          # keep the large-file branch unchanged; replace only the small-file body below
-          if old not in s:
-              raise SystemExit('telegram handler not found')
-
           old = '''    msg = await update.message.reply_text("📥 جارٍ التنزيل من تلجرام...")
     start = time.time()
     try:
@@ -148,8 +135,7 @@ async def handle_link(update, context, url):
             size = os.path.getsize(path)
             await msg.edit_text(f"📤 جارٍ الرفع... ({human_size(size)})")
             result = await asyncio.to_thread(upload_to_drive, path)
-            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\
-\\n\\n📁 [{result['name']}]({result['link']})\\n💾 {human_size(size)}\\n⏱️ {human_time(time.time() - start)}", parse_mode="Markdown", disable_web_page_preview=True)
+            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\\n\\n📁 [{result['name']}]({result['link']})\\n💾 {human_size(size)}\\n⏱️ {human_time(time.time() - start)}", parse_mode="Markdown", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await msg.edit_text(f"❌ فشل:\\n`{str(e)[:300]}`", parse_mode="Markdown")
