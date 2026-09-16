@@ -32,6 +32,7 @@ GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 PROGRESS_UPDATE_INTERVAL = 3
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
+MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -397,6 +398,21 @@ async def do_download(update, context, msg, url, quality, info):
 
 
 async def handle_telegram_file(update, context, file_obj):
+    file_size = getattr(file_obj, "file_size", None) or 0
+    if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 تحويل الملف إلى رابط", url="https://t.me/File2url_rbot")]
+        ])
+        await update.message.reply_text(
+            "📦 *الملف كبير جدًا*\n\n"
+            f"💾 الحجم: {human_size(file_size)}\n"
+            "⚠️ Telegram لا يسمح للبوت بتنزيل الملفات الأكبر من 20MB مباشرة.\n\n"
+            "حوّل الملف إلى رابط عبر الزر أدناه، ثم أرسل الرابط إلى DriveSaverBot وسأحفظه في Google Drive.",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return
+
     msg = await update.message.reply_text("📥 جارٍ التنزيل من تلجرام...")
     start = time.time()
     try:
