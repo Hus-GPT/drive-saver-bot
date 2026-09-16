@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 import tempfile
 import time
@@ -13,7 +12,8 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import yt_dlp
@@ -23,7 +23,9 @@ import requests
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 BOT_PASSWORD = os.environ["BOT_PASSWORD"]
 DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 PROGRESS_UPDATE_INTERVAL = 3  # ثوانٍ بين تحديثات التقدم
 
 # ================== السجلات ==================
@@ -41,11 +43,16 @@ cancel_flags = {}        # {user_id: True/False}
 
 # ================== Google Drive ==================
 def get_drive_service():
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_CREDS_JSON),
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
         scopes=["https://www.googleapis.com/auth/drive"]
     )
-    return build("drive", "v3", credentials=creds)
+    creds.refresh(Request())
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 drive_service = get_drive_service()
