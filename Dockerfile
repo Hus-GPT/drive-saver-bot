@@ -18,7 +18,6 @@ RUN git clone --depth 1 --branch 2.0.0 https://github.com/Brainicism/bgutil-ytdl
     npx tsc
 
 COPY bot.py .
-COPY render_probe.py .
 
 # Add a single FIFO queue around downloads/uploads without changing the source file yet.
 RUN python3 - <<'PY'
@@ -219,6 +218,5 @@ p.write_text(s)
 print('Queue patch applied and syntax validated.')
 PY
 
-# Run the temporary Render-side probe once (when RENDER_PROBE_URL is set),
-# then start the PO-token provider and the Telegram bot.
-CMD ["sh", "-c", "python3 render_probe.py; node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --host 127.0.0.1 --port 4416 & exec python3 -u bot.py"]
+# Start the PO-token provider on localhost, then start the Telegram bot.
+CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js --host 127.0.0.1 --port 4416 & exec python3 -u bot.py"]
