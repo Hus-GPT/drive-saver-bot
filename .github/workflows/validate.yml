@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  python-syntax:
+  syntax:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -20,3 +20,5 @@ jobs:
         run: |
           python -m py_compile bot.py
           python -m py_compile tools/github_download/transfer.py
+      - name: Check Worker JavaScript syntax
+        run: node --check cloudflare/worker.js
