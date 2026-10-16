@@ -2,12 +2,12 @@ name: Validate
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
     branches: [main]
 
 jobs:
-  python-syntax:
+  syntax:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,4 +17,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile Python
-        run: python -m py_compile bot.py
+        run: |
+          python -m py_compile bot.py
+          python -m py_compile tools/github_download/transfer.py
+      - name: Check Worker JavaScript syntax
+        run: node --input-type=module --check < cloudflare/worker.js
