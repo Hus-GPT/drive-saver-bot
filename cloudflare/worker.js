@@ -1,12 +1,6 @@
 /**
  * HTTP Shortcuts control plane for the GitHub Actions transfer workflow.
- *
- * Cloudflare Worker secrets required:
- *   GH_TOKEN - GitHub fine-grained PAT with Actions read/write on this repo
- *   API_KEY  - random bearer token used by HTTP Shortcuts
- *
- * Deploy only after the workflow PR has been merged to main, or set WORKFLOW_REF
- * to the feature branch for a controlled test.
+ * Cloudflare Worker secrets: GH_TOKEN and API_KEY.
  */
 const OWNER = "Hus-GPT";
 const REPO = "drive-saver-bot";
@@ -29,25 +23,23 @@ function json(data, status = 200) {
 
 function authorized(request, env) {
   const auth = request.headers.get("authorization") || "";
-  return Boolean(env.API_KEY && auth === \`Bearer \${env.API_KEY}\`);
+  return Boolean(env.API_KEY && auth === ("Bearer " + env.API_KEY));
 }
 
 async function github(path, env, options = {}) {
   if (!env.GH_TOKEN) throw new Error("Missing Cloudflare secret GH_TOKEN");
-  const response = await fetch(\`\${GH_API}\${path}\`, {
-    ...options,
-    headers: {
-      "accept": "application/vnd.github+json",
-      "authorization": \`Bearer \${env.GH_TOKEN}\`,
-      "x-github-api-version": "2022-11-28",
-      "user-agent": "github-download-control-worker",
-      ...(options.body ? { "content-type": "application/json" } : {}),
-      ...(options.headers || {}),
-    },
-  });
+  const headers = {
+    "accept": "application/vnd.github+json",
+    "authorization": "Bearer " + env.GH_TOKEN,
+    "x-github-api-version": "2022-11-28",
+    "user-agent": "github-download-control-worker",
+  };
+  if (options.body) headers["content-type"] = "application/json";
+  Object.assign(headers, options.headers || {});
+  const response = await fetch(GH_API + path, { ...options, headers });
   if (!response.ok) {
     const details = (await response.text()).slice(0, 800);
-    throw new Error(\`GitHub API returned \${response.status}: \${details}\`);
+    throw new Error("GitHub API returned " + response.status + ": " + details);
   }
   if (response.status === 204) return null;
   return response.json();
@@ -81,19 +73,19 @@ export default {
         let parsed;
         try { parsed = new URL(body.url); } catch { return json({ error: "Invalid URL." }, 400); }
         if (!["https:", "http:"].includes(parsed.protocol) || parsed.username || parsed.password) {
-          return json({ error: "Only public HTTP/HTTPS URLs without embedded credentials are accepted." }, 400);
+          return json({ error: "Only HTTP/HTTPS URLs without embedded credentials are accepted." }, 400);
         }
         const inputs = { url: body.url.trim() };
         if (typeof body.filename === "string" && body.filename.trim()) {
           inputs.filename = body.filename.trim().slice(0, 180);
         }
-        await github(\`/repos/\${OWNER}/\${REPO}/actions/workflows/\${WORKFLOW}/dispatches\`, env, {
+        await github("/repos/" + OWNER + "/" + REPO + "/actions/workflows/" + WORKFLOW + "/dispatches", env, {
           method: "POST",
           body: JSON.stringify({ ref: WORKFLOW_REF, inputs }),
         });
         return json({
           accepted: true,
-          message: "Workflow dispatch accepted. Query /status to inspect the latest run.",
+          message: "Workflow dispatch accepted. Query /status to inspect recent runs.",
           workflow: WORKFLOW,
           ref: WORKFLOW_REF,
         }, 202);
@@ -101,7 +93,7 @@ export default {
 
       if (url.pathname === "/status" && request.method === "GET") {
         const result = await github(
-          \`/repos/\${OWNER}/\${REPO}/actions/workflows/\${WORKFLOW}/runs?per_page=5&branch=\${encodeURIComponent(WORKFLOW_REF)}\`,
+          "/repos/" + OWNER + "/" + REPO + "/actions/workflows/" + WORKFLOW + "/runs?per_page=5&branch=" + encodeURIComponent(WORKFLOW_REF),
           env,
         );
         const runs = (result.workflow_runs || []).map(run => ({
@@ -123,11 +115,11 @@ export default {
         const body = await request.json().catch(() => ({}));
         const runId = String(body.run_id || "");
         if (!/^\d+$/.test(runId)) return json({ error: "Provide a numeric run_id." }, 400);
-        const run = await github(\`/repos/\${OWNER}/\${REPO}/actions/runs/\${runId}\`, env);
-        if (run.repository?.full_name !== \`\${OWNER}/\${REPO}\`) {
+        const run = await github("/repos/" + OWNER + "/" + REPO + "/actions/runs/" + runId, env);
+        if (run.repository && run.repository.full_name !== OWNER + "/" + REPO) {
           return json({ error: "Run does not belong to the configured repository." }, 403);
         }
-        const jobs = await github(\`/repos/\${OWNER}/\${REPO}/actions/runs/\${runId}/jobs?per_page=20\`, env);
+        const jobs = await github("/repos/" + OWNER + "/" + REPO + "/actions/runs/" + runId + "/jobs?per_page=20", env);
         return json({
           id: run.id,
           status: run.status,
