@@ -925,12 +925,12 @@ async def run_drive_index(message):
             return
         last_update["time"] = now
         text = (
-            "🧭 فهرسة الملفات القديمة داخل Auto Downloads\\n"
-            f"📄 تمت مراجعة: {stats['seen']}\\n"
-            f"🔐 أُضيفت بصمات: {stats['indexed']}\\n"
-            f"♻️ بصمات موجودة مسبقًا: {stats['already_indexed']}\\n"
-            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\\n"
-            f"⚠️ أخطاء: {stats['errors']}\\n"
+            "🧭 فهرسة الملفات القديمة داخل Auto Downloads\n"
+            f"📄 تمت مراجعة: {stats['seen']}\n"
+            f"🔐 أُضيفت بصمات: {stats['indexed']}\n"
+            f"♻️ بصمات موجودة مسبقًا: {stats['already_indexed']}\n"
+            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\n"
+            f"⚠️ أخطاء: {stats['errors']}\n"
             f"📦 البيانات المفحوصة: {human_size(stats['bytes_hashed'])}"
         )
         loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit_plain(message, text)))
@@ -942,13 +942,13 @@ async def run_drive_index(message):
         )
         stats = await asyncio.to_thread(index_existing_drive_files, progress)
         await message.edit_text(
-            "✅ انتهت فهرسة الملفات القديمة.\\n\\n"
-            f"📄 تمت مراجعة: {stats['seen']}\\n"
-            f"🔐 أُضيفت بصمات جديدة: {stats['indexed']}\\n"
-            f"♻️ كانت مفهرسة: {stats['already_indexed']}\\n"
-            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\\n"
-            f"⚠️ أخطاء: {stats['errors']}\\n"
-            f"📦 البيانات المفحوصة: {human_size(stats['bytes_hashed'])}\\n\\n"
+            "✅ انتهت فهرسة الملفات القديمة.\n\n"
+            f"📄 تمت مراجعة: {stats['seen']}\n"
+            f"🔐 أُضيفت بصمات جديدة: {stats['indexed']}\n"
+            f"♻️ كانت مفهرسة: {stats['already_indexed']}\n"
+            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\n"
+            f"⚠️ أخطاء: {stats['errors']}\n"
+            f"📦 البيانات المفحوصة: {human_size(stats['bytes_hashed'])}\n\n"
             "ستُستخدم البصمات الجديدة في منع تكرار المحتوى."
         )
     except Exception as exc:
