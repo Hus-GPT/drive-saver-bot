@@ -495,66 +495,122 @@ async def safe_edit(msg, text):
 
 async def do_download(update, context, msg, url, quality, info):
     uid = update.effective_user.id
-    cancel_flags[uid] = False
-    start = time.time()
-    last = {"t": 0}
+    task_id = uuid.uuid4().hex[:8]
+    started = time.time()
     loop = asyncio.get_running_loop()
+    sample = {"time": started, "bytes": 0, "last_edit": 0.0}
+    active_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "url": url,
+        "status": "تنزيل", "started_at": started,
+    }
+    cancel_flags[task_id] = False
+    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "started", "started_at": started})
 
     def cancelled():
-        return cancel_flags.get(uid, False)
+        return cancel_flags.get(task_id, False)
 
-    def cb(prefix):
-        def f(d):
-            now = time.time()
-            if now - last["t"] < PROGRESS_UPDATE_INTERVAL:
-                return
-            last["t"] = now
-            done = d.get("downloaded_bytes", 0)
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            speed = d.get("speed") or 0
-            if total:
-                pct = done / total * 100
-                filled = min(20, int(pct / 5))
-                bar = "█" * filled + "░" * (20 - filled)
-                text = f"{prefix}\n\n`[{bar}]` {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
-            else:
-                text = f"{prefix}\n\n💾 {human_size(done)}"
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
-        return f
+    def download_progress(data):
+        now = time.time()
+        done = int(data.get("downloaded_bytes") or 0)
+        total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
+        elapsed = max(now - sample["time"], 0.001)
+        speed = data.get("speed") or max(0, done - sample["bytes"]) / elapsed
+        sample.update({"time": now, "bytes": done})
+        active_tasks[task_id].update({
+            "status": "تنزيل", "download_bytes": done,
+            "download_total": total, "download_speed": speed,
+        })
+        if now - sample["last_edit"] < PROGRESS_UPDATE_INTERVAL:
+            return
+        sample["last_edit"] = now
+        if total:
+            pct = min(100, done / total * 100)
+            filled = min(20, int(pct / 5))
+            bar = "█" * filled + "░" * (20 - filled)
+            text = f"⬇️ *تنزيل الملف*\\n\\nالمهمة: {task_id}\\n[{bar}] {pct:.1f}%\\n💾 {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s"
+        else:
+            text = f"⬇️ *تنزيل الملف*\\n\\nالمهمة: {task_id}\\n💾 {human_size(done)}\\n⚡ {human_size(speed)}/s"
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            progress = cb("⬇️ التحميل")
+        with tempfile.TemporaryDirectory(prefix="drive-saver-") as tmp:
             try:
                 if is_youtube_url(url):
                     await youtube_gate()
                 if info and info.get("is_video"):
-                    file_path = await asyncio.to_thread(download_video, url, tmp, quality or "720", progress, cancelled)
+                    file_path = await asyncio.to_thread(
+                        download_video, url, tmp, quality or "720", download_progress, cancelled
+                    )
                 else:
-                    file_path = await asyncio.to_thread(download_direct, url, tmp, progress, cancelled)
-            except Exception as e:
-                if "__CANCELLED__" in str(e):
-                    await msg.edit_text("🛑 تم الإلغاء.")
+                    file_path = await asyncio.to_thread(
+                        download_direct, url, tmp, download_progress, cancelled
+                    )
+            except Exception as exc:
+                if "__CANCELLED__" in str(exc):
+                    await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
                     return
-                if info and info.get("is_video"):
-                    if is_rate_limit_error(e) and is_youtube_url(url):
-                        await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429).\n\nلن نكرر الطلبات بسرعة. جرّب لاحقاً.")
-                        return
-                    raise
-                logger.warning(f"direct download failed: {e}")
+                if info and info.get("is_video") and is_rate_limit_error(exc) and is_youtube_url(url):
+                    await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429). جرّب لاحقًا.")
+                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:400]})
+                    return
                 raise
-            if not file_path or not os.path.exists(file_path):
-                raise Exception("لم يتم إنشاء أي ملف")
+
+            if cancelled():
+                await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+                return
+            if not file_path or not os.path.isfile(file_path):
+                raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
             size = os.path.getsize(file_path)
-            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\n💾 {human_size(size)}")
-            result = await asyncio.to_thread(upload_to_drive, file_path)
-            elapsed = time.time() - start
-            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\n\n📁 [{result['name']}]({result['link']})\n💾 الحجم: {human_size(size)}\n⏱️ الوقت: {human_time(elapsed)}\n⚡ متوسط السرعة: {human_size(size / elapsed if elapsed else 0)}/s", parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ فشل:\n`{str(e)[:300]}`", parse_mode="Markdown")
+            active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "name": Path(file_path).name, "size": size, "status": "uploading"})
+            upload_started = time.time()
+            upload_sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
+
+            def upload_progress(done, total):
+                now = time.time()
+                speed = max(0, done - upload_sample["bytes"]) / max(now - upload_sample["time"], 0.001)
+                upload_sample.update({"time": now, "bytes": done})
+                active_tasks[task_id].update({
+                    "status": "رفع إلى Drive", "upload_bytes": done,
+                    "upload_total": total, "upload_speed": speed,
+                })
+                if now - upload_sample["last_edit"] < PROGRESS_UPDATE_INTERVAL and done < total:
+                    return
+                upload_sample["last_edit"] = now
+                pct = done / total * 100 if total else 0
+                text = f"📤 *رفع إلى Google Drive*\\n\\nالمهمة: {task_id}\\nالتقدم: {pct:.1f}% — {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s\\n⏱️ {human_time(now - upload_started)}"
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+
+            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\\n💾 {human_size(size)}\\nالمهمة: {task_id}")
+            result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress)
+            elapsed = time.time() - started
+            persist_task({
+                "task_id": task_id, "user_id": uid, "url": url,
+                "name": result["name"], "size": size, "status": "completed",
+                "drive_file_id": result["id"], "drive_link": result["link"],
+                "elapsed_seconds": round(elapsed, 2),
+                "average_bytes_per_second": round(size / elapsed, 2) if elapsed else 0,
+            })
+            await msg.edit_text(
+                f"✅ *تم الحفظ والتحقق في Drive!*\\n\\n📁 [{result['name']}]({result['link']})"
+                f"\\n💾 الحجم: {human_size(size)}\\n⏱️ الوقت الكلي: {human_time(elapsed)}"
+                f"\\n⚡ متوسط السرعة الكلية: {human_size(size / elapsed if elapsed else 0)}/s"
+                f"\\n🆔 المهمة: {task_id}",
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
+        persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
+        try:
+            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\\n{str(exc)[:300]}")
+        except Exception:
+            pass
     finally:
-        cancel_flags.pop(uid, None)
+        cancel_flags.pop(task_id, None)
+        active_tasks.pop(task_id, None)
 
 
 async def handle_telegram_file(update, context, file_obj):
