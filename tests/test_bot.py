@@ -133,6 +133,24 @@ class TransferTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
 
+    def test_task_journal_redacts_signed_url_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = os.path.join(tmp, "tasks.jsonl")
+            with patch.object(bot, "TASK_LOG_PATH", journal):
+                bot.persist_task({
+                    "task_id": "private-url",
+                    "status": "started",
+                    "url": "https://example.com/file.zip?X-Amz-Signature=secretvalue&download=1",
+                })
+            with open(journal, encoding="utf-8") as handle:
+                record = __import__("json").loads(handle.readline())
+            self.assertNotIn("url", record)
+            with open(journal, encoding="utf-8") as handle:
+                logged_text = handle.read()
+            self.assertNotIn("secretvalue", logged_text)
+            self.assertTrue(record["recovery_requires_manual_url"])
+            self.assertEqual(record["url_redacted"], "https://example.com/file.zip")
+
     def test_direct_file_url_detection_uses_path_not_query(self):
         self.assertTrue(bot.is_likely_direct_file_url("https://example.com/archive.zip?token=abc"))
         self.assertFalse(bot.is_likely_direct_file_url("https://example.com/watch?id=archive.zip"))
