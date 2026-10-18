@@ -101,7 +101,7 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result["id"], "drive-id-1")
             self.assertEqual(result["size"], 10)
             self.assertEqual(progress, [(10, 10)])
-            self.assertEqual(media_factory.call_args.kwargs["chunksize"], 8 * 1024 * 1024)
+            self.assertEqual(media_factory.call_args.kwargs["chunksize"], 32 * 1024 * 1024)
             self.assertTrue(media_factory.call_args.kwargs["resumable"])
 
     def test_existing_identical_file_is_not_uploaded_twice(self):
@@ -172,6 +172,15 @@ class TransferTests(unittest.TestCase):
                 archive.writestr("../outside.txt", "unsafe")
             with self.assertRaisesRegex(RuntimeError, "غير آمن"):
                 bot.extract_archive_contents(archive_path, tmp)
+
+    def test_progress_format_shows_percent_and_speed(self):
+        text = bot.format_task_progress({
+            "id": "abc123", "name": "video.mp4", "status": "تنزيل",
+            "download_bytes": 50, "download_total": 100, "download_speed": 10,
+        })
+        self.assertIn("abc123", text)
+        self.assertIn("50.0%", text)
+        self.assertIn("السرعة", text)
 
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:
