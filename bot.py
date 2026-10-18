@@ -502,7 +502,7 @@ async def cmd_help(update, context):
         "📖 *المساعدة*\n\n"
         "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
         "📎 أرسل ملفاً → يُحفظ في Drive\n"
-        "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📋 /queue — العمليات الجارية والمنتظرة\n"\n        "📈 /progress — لوحة تقدم قابلة للتحديث لكل مهمة\n"
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
         "📒 /colab — فتح دفتر Google Colab\n"
@@ -561,11 +561,11 @@ def format_task_progress(task):
         bar = "░" * 20
         amount = human_size(done) if done else "جارٍ تحديد الحجم"
     return (
-        f"🆔 المهمة: {task_id}\\n"
-        f"📄 الملف: {str(name)[:100]}\\n"
-        f"⚙️ المرحلة: {phase} — {status}\\n"
-        f"[{bar}]\\n"
-        f"💾 {amount}\\n"
+        f"🆔 المهمة: {task_id}\n"
+        f"📄 الملف: {str(name)[:100]}\n"
+        f"⚙️ المرحلة: {phase} — {status}\n"
+        f"[{bar}]\n"
+        f"💾 {amount}\n"
         f"⚡ السرعة: {human_size(speed)}/ث"
     )
 
@@ -589,10 +589,10 @@ async def cmd_progress(update, context):
         await update.message.reply_text("لا توجد مهام نشطة الآن. أرسل رابطًا أو ملفًا لبدء مهمة جديدة.")
         return
     tasks.sort(key=lambda task: task.get("started_at", 0))
-    lines = ["📊 *لوحة تقدم المهام*\\n", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
+    lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
     lines.extend(format_task_progress(task) for task in tasks[:8])
     await update.message.reply_text(
-        "\\n\\n".join(lines),
+        "\n\n".join(lines),
         parse_mode="Markdown",
         reply_markup=build_progress_keyboard(tasks),
         disable_web_page_preview=True,
