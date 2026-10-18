@@ -463,6 +463,110 @@ def extract_first_url(text):
     return None
 
 
+def extract_urls(text):
+    """Extract all unique HTTP(S) URLs in first-seen order."""
+    urls, seen = [], set()
+    for match in re.finditer(r"https?://[^\\s<>]+", text or "", re.IGNORECASE):
+        candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}»”’")
+        parsed = urlparse(candidate)
+        if parsed.scheme in ("http", "https") and parsed.netloc and candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+    return urls
+
+
+def is_google_drive_url(url):
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    return host in {"drive.google.com", "docs.google.com"}
+
+
+def google_drive_file_id(url):
+    if not is_google_drive_url(url):
+        return None
+    parsed = urlparse(url)
+    match = re.search(r"/(?:file/d|document/d|spreadsheets/d|presentation/d|drawings/d|folders)/([A-Za-z0-9_-]+)", parsed.path)
+    if match:
+        return match.group(1)
+    return next((value for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                 if key == "id" and re.fullmatch(r"[A-Za-z0-9_-]+", value)), None)
+
+
+DRIVE_EXPORT_TYPES = {
+    "application/vnd.google-apps.document": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
+    "application/vnd.google-apps.spreadsheet": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
+    "application/vnd.google-apps.presentation": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
+    "application/vnd.google-apps.drawing": ("application/pdf", ".pdf"),
+}
+
+
+def download_google_drive_resource(url, out_dir, service=None):
+    """Download a Drive file or recursively download a folder, exporting supported native Docs."""
+    file_id = google_drive_file_id(url)
+    if not file_id:
+        raise RuntimeError("تعذر استخراج معرّف ملف Google Drive من الرابط.")
+    service = service or drive_service or get_drive_service()
+    root = Path(out_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    results, visited = [], set()
+
+    def save_file(item, relative_parent):
+        mime, name = item.get("mimeType", ""), item.get("name") or item["id"]
+        if mime.startswith("application/vnd.google-apps.") and mime != "application/vnd.google-apps.folder":
+            export = DRIVE_EXPORT_TYPES.get(mime)
+            if not export:
+                raise RuntimeError(f"نوع ملف Google Drive الأصلي غير مدعوم للتصدير: {mime}")
+            export_mime, extension = export
+            name = Path(name).stem + extension
+            request = service.files().export_media(fileId=item["id"], mimeType=export_mime)
+        else:
+            request = service.files().get_media(fileId=item["id"])
+        parts = [re.sub(r'[<>:"|?*\\\\]', "_", p).strip() or "file"
+                 for p in Path(relative_parent, name).parts if p not in ("", ".")]
+        target = root.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as handle:
+            downloader = MediaIoBaseDownload(handle, request, chunksize=8 * 1024 * 1024)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk(num_retries=3)
+        results.append((str(target), str(target.relative_to(root).parent)))
+
+    def walk(folder_id, relative_dir, depth=0):
+        if depth > 30:
+            raise RuntimeError("تجاوز مجلد Drive عمق التداخل الآمن (30 مستوى).")
+        if folder_id in visited:
+            return
+        visited.add(folder_id)
+        page_token = None
+        while True:
+            args = {"q": f"'{folder_id}' in parents and trashed = false", "pageSize": 1000,
+                    "fields": "nextPageToken,files(id,name,mimeType,size,webViewLink)"}
+            if page_token:
+                args["pageToken"] = page_token
+            response = service.files().list(**args).execute(num_retries=3)
+            for child in response.get("files", []):
+                name = child.get("name") or child.get("id") or "item"
+                rel = str(Path(relative_dir) / name) if relative_dir else name
+                if child.get("mimeType") == "application/vnd.google-apps.folder":
+                    walk(child["id"], rel, depth + 1)
+                else:
+                    if len(results) >= 1000:
+                        raise RuntimeError("مجلد Drive يتجاوز الحد الآمن البالغ 1000 ملف.")
+                    save_file(child, relative_dir)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    item = service.files().get(fileId=file_id, fields="id,name,mimeType,size,webViewLink").execute(num_retries=3)
+    if item.get("mimeType") == "application/vnd.google-apps.folder":
+        walk(file_id, item.get("name") or "Drive folder")
+    else:
+        save_file(item, "")
+    if not results:
+        raise RuntimeError("لا توجد ملفات قابلة للتنزيل في عنصر Google Drive هذا.")
+    return results
+
+
 def is_youtube_url(url):
     u = url.lower()
     return "youtube.com/" in u or "youtu.be/" in u or "youtube-nocookie.com/" in u
@@ -504,12 +608,27 @@ def is_likely_direct_file_url(url):
 
 def ytdlp_opts(extra=None):
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    # Optional private cookie file configured in the runtime; never commit it.
+    cookie_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_file and os.path.isfile(cookie_file):
+        opts["cookiefile"] = cookie_file
     if extra:
         opts.update(extra)
     return opts
 
 
+def is_youtube_bot_challenge(exc):
+    text = str(exc).lower()
+    return (
+        "sign in to confirm you're not a bot" in text
+        or "confirm you’re not a bot" in text
+        or "cookies-from-browser" in text
+    )
+
+
 def fetch_url_info(url):
+    if is_google_drive_url(url):
+        return {"is_video": False, "url": url, "google_drive": True}
     # Social/video post URLs must go through yt-dlp even when their path looks
     # like a media filename; platform pages are not generic file endpoints.
     if is_likely_direct_file_url(url) and not is_video_platform_url(url):
@@ -1226,15 +1345,17 @@ async def handle_message(update, context):
         message.document or message.video or message.audio or message.animation
         or message.voice or message.video_note or (message.photo[-1] if message.photo else None)
     )
+    text = (message.text or message.caption or "").strip()
+    urls = extract_urls(text)
+    handled = False
     if file_obj:
         await handle_telegram_file(update, context, file_obj)
-        return
-    text = (update.message.text or "").strip()
-    url = extract_first_url(text)
-    if url:
+        handled = True
+    for url in urls:
         await handle_link(update, context, url)
-        return
-    await update.message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
+        handled = True
+    if not handled:
+        await update.message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
 
 
 def find_duplicate_url_task(url):
@@ -1409,7 +1530,37 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
             try:
                 if is_youtube_url(url):
                     await youtube_gate()
-                if info and info.get("is_video"):
+                drive_items = None
+                if info and info.get("google_drive"):
+                    drive_items = await asyncio.to_thread(download_google_drive_resource, url, tmp)
+                    # A single file follows the standard archive/dedupe/upload path.
+                    # Folder contents are uploaded individually into matching nested folders.
+                    if len(drive_items) > 1 or Path(drive_items[0][0]).parent != Path(tmp):
+                        results = []
+                        for drive_path, parent_text in drive_items:
+                            if cancelled():
+                                raise RuntimeError("__CANCELLED__")
+                            parent = Path(parent_text)
+                            folder_id = await asyncio.to_thread(ensure_drive_folder_path, parent)
+                            result = await asyncio.to_thread(upload_to_drive, drive_path, None, cancelled, folder_id)
+                            relative_name = str(parent / result["name"]) if str(parent) != "." else result["name"]
+                            results.append((relative_name, result))
+                            persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                                "user_id": uid, "url": url, "name": result["name"],
+                                "drive_file_id": result["id"], "size": result["size"],
+                                "status": "drive_item_completed", "already_exists": result.get("already_exists", False)})
+                        summary = "\\n".join(
+                            f"• {name} — " + ("موجود مسبقًا" if result.get("already_exists") else "تم الرفع")
+                            for name, result in results)
+                        persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                            "user_id": uid, "url": url, "status": "completed",
+                            "google_drive_folder": True, "file_count": len(results)})
+                        await msg.edit_text(
+                            f"✅ تمت معالجة Google Drive ورفع/تجاوز {len(results)} ملفًا مع الحفاظ على بنية المجلدات.\\n\\n{summary}",
+                            disable_web_page_preview=True)
+                        return
+                    file_path = drive_items[0][0]
+                elif info and info.get("is_video"):
                     file_path = await asyncio.to_thread(
                         download_video, url, tmp, quality or "720", download_progress, cancelled
                     )
@@ -1425,6 +1576,14 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                 if info and info.get("is_video") and is_rate_limit_error(exc) and is_youtube_url(url):
                     await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429). جرّب لاحقًا.")
                     persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:400]})
+                    return
+                if is_youtube_url(url) and is_youtube_bot_challenge(exc):
+                    await msg.edit_text(
+                        "⚠️ YouTube يطلب التحقق من أن الطلب ليس آليًا. قد يساعد تحديث yt-dlp أو إعداد ملف Cookies خاص داخل Colab، "
+                        "لكن لا يوجد ضمان للنجاح. لا تشارك ملف Cookies ولا ترفعه إلى GitHub."
+                    )
+                    persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                        "user_id": uid, "url": url, "status": "failed", "error_category": "youtube_bot_challenge"})
                     return
                 raise
 
