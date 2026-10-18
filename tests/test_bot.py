@@ -153,6 +153,83 @@ class TransferTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
 
+    def test_index_existing_drive_files_hashes_nested_files_and_skips_native_docs(self):
+        contents = {"root-bin": b"root bytes", "nested-bin": b"nested bytes"}
+
+        class FakeDownloader:
+            def __init__(self, sink, request, chunksize):
+                self.sink = sink
+                self.request = request
+                self.done = False
+
+            def next_chunk(self, num_retries=0):
+                if not self.done:
+                    self.sink.write(contents[self.request])
+                    self.done = True
+                return FakeStatus(), self.done
+
+        class UpdateRequest:
+            def __init__(self, owner, file_id, body):
+                self.owner = owner
+                self.file_id = file_id
+                self.body = body
+
+            def execute(self, num_retries=0):
+                self.owner.updates[self.file_id] = self.body
+                return {"id": self.file_id, **self.body}
+
+        class IndexFiles:
+            def __init__(self):
+                self.updates = {}
+                self.by_parent = {
+                    "root-folder": [
+                        {"id": "subfolder", "name": "nested", "mimeType": "application/vnd.google-apps.folder"},
+                        {"id": "root-bin", "name": "root.bin", "mimeType": "application/octet-stream", "appProperties": {}},
+                        {"id": "native-doc", "name": "notes", "mimeType": "application/vnd.google-apps.document", "appProperties": {}},
+                        {"id": "already", "name": "indexed.bin", "mimeType": "application/octet-stream", "appProperties": {"sha256": "known"}},
+                    ],
+                    "subfolder": [
+                        {"id": "nested-bin", "name": "nested.bin", "mimeType": "application/octet-stream", "appProperties": {}},
+                    ],
+                }
+
+            def list(self, q, pageSize, fields, **kwargs):
+                parent = __import__("re").search(r"'([^']+)' in parents", q).group(1)
+                return FakeListRequest(self.by_parent.get(parent, []))
+
+            def get_media(self, fileId):
+                return fileId
+
+            def update(self, fileId, body, fields):
+                return UpdateRequest(self, fileId, body)
+
+        class IndexService:
+            def __init__(self):
+                self.resource = IndexFiles()
+
+            def files(self):
+                return self.resource
+
+        service = IndexService()
+        with patch.object(bot, "drive_service", service), patch.object(
+            bot, "DRIVE_FOLDER_ID", "root-folder"
+        ), patch.object(bot, "MediaIoBaseDownload", FakeDownloader):
+            stats = bot.index_existing_drive_files()
+
+        self.assertEqual(stats["seen"], 4)
+        self.assertEqual(stats["indexed"], 2)
+        self.assertEqual(stats["already_indexed"], 1)
+        self.assertEqual(stats["skipped_native"], 1)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(
+            service.resource.updates["root-bin"]["appProperties"]["sha256"],
+            __import__("hashlib").sha256(contents["root-bin"]).hexdigest(),
+        )
+        self.assertEqual(
+            service.resource.updates["nested-bin"]["appProperties"]["sha256"],
+            __import__("hashlib").sha256(contents["nested-bin"]).hexdigest(),
+        )
+
     def test_archive_nested_folders_are_created_and_reused_in_drive(self):
         class FolderCreateRequest:
             def __init__(self, owner, body):

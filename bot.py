@@ -27,7 +27,7 @@ from telegram.ext import (
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import yt_dlp
 import requests
 import rarfile
@@ -61,6 +61,7 @@ active_tasks = {}
 transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '8'))))
 cancel_flags = {}
 progress_dashboard_loops = set()
+indexing_in_progress = False
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
 
@@ -195,6 +196,100 @@ def extract_archive_contents(file_path, work_dir):
         raise RuntimeError("الأرشيف لا يحتوي على ملفات قابلة للاستخراج.")
     logger.info("Extracted %s files from archive %s", len(members), source.name)
     return members
+
+
+class _HashSink:
+    """Minimal write-only sink for hashing Drive downloads without storing file bytes."""
+    def __init__(self):
+        self._digest = hashlib.sha256()
+        self.size = 0
+
+    def write(self, chunk):
+        self._digest.update(chunk)
+        self.size += len(chunk)
+        return len(chunk)
+
+    def hexdigest(self):
+        return self._digest.hexdigest()
+
+
+def index_existing_drive_files(progress_cb=None, cancel_check=None):
+    """Fingerprint existing binary files under Auto Downloads, including nested folders."""
+    service = drive_service or get_drive_service()
+    stats = {
+        "seen": 0, "indexed": 0, "already_indexed": 0,
+        "skipped_native": 0, "errors": 0, "bytes_hashed": 0,
+    }
+    folder_stack = [DRIVE_FOLDER_ID]
+    visited_folders = set()
+    while folder_stack:
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+        parent_id = folder_stack.pop()
+        if parent_id in visited_folders:
+            continue
+        visited_folders.add(parent_id)
+        page_token = None
+        while True:
+            if cancel_check and cancel_check():
+                raise RuntimeError("__CANCELLED__")
+            kwargs = {
+                "q": f"'{parent_id}' in parents and trashed = false",
+                "pageSize": 1000,
+                "fields": "nextPageToken, files(id, name, mimeType, size, appProperties)",
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = service.files().list(**kwargs).execute(num_retries=3)
+            for item in response.get("files", []):
+                if cancel_check and cancel_check():
+                    raise RuntimeError("__CANCELLED__")
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    folder_stack.append(item["id"])
+                    continue
+                stats["seen"] += 1
+                properties = item.get("appProperties") or {}
+                if properties.get("sha256"):
+                    stats["already_indexed"] += 1
+                    if progress_cb:
+                        progress_cb(dict(stats), item)
+                    continue
+                if str(item.get("mimeType", "")).startswith("application/vnd.google-apps."):
+                    stats["skipped_native"] += 1
+                    if progress_cb:
+                        progress_cb(dict(stats), item)
+                    continue
+                try:
+                    sink = _HashSink()
+                    downloader = MediaIoBaseDownload(
+                        sink, service.files().get_media(fileId=item["id"]),
+                        chunksize=8 * 1024 * 1024,
+                    )
+                    done = False
+                    while not done:
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("__CANCELLED__")
+                        _, done = downloader.next_chunk(num_retries=3)
+                    updated_properties = dict(properties)
+                    updated_properties["sha256"] = sink.hexdigest()
+                    service.files().update(
+                        fileId=item["id"],
+                        body={"appProperties": updated_properties},
+                        fields="id, appProperties",
+                    ).execute(num_retries=3)
+                    stats["indexed"] += 1
+                    stats["bytes_hashed"] += sink.size
+                except Exception as exc:
+                    if "__CANCELLED__" in str(exc):
+                        raise
+                    stats["errors"] += 1
+                    logger.warning("Could not index existing Drive file %s: %s", item.get("name"), exc)
+                if progress_cb:
+                    progress_cb(dict(stats), item)
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+    return stats
 
 
 def ensure_drive_folder_path(relative_directory, service=None):
@@ -682,6 +777,7 @@ async def cmd_help(update, context):
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
         "🔁 /retry [رقم المهمة] — إعادة محاولة مهمة فاشلة\\n"
+        "🧭 /index — فهرسة الملفات القديمة داخل Auto Downloads مرة واحدة\\n"
         "📒 /colab — فتح دفتر Google Colab\n"
         "🆔 /id — معرف Telegram",
         parse_mode="Markdown",
@@ -817,6 +913,72 @@ async def cmd_progress(update, context):
             progress_dashboard_loop(context.application, chat_id, message.message_id),
             name=f"progress-dashboard-{chat_id}",
         )
+
+async def run_drive_index(message):
+    global indexing_in_progress
+    loop = asyncio.get_running_loop()
+    last_update = {"time": 0.0}
+
+    def progress(stats, item):
+        now = time.time()
+        if now - last_update["time"] < 3:
+            return
+        last_update["time"] = now
+        text = (
+            "🧭 فهرسة الملفات القديمة داخل Auto Downloads\n"
+            f"📄 تمت مراجعة: {stats['seen']}\n"
+            f"🔐 أُضيفت بصمات: {stats['indexed']}\n"
+            f"♻️ بصمات موجودة مسبقًا: {stats['already_indexed']}\n"
+            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\n"
+            f"⚠️ أخطاء: {stats['errors']}\n"
+            f"📦 البيانات المفحوصة: {human_size(stats['bytes_hashed'])}"
+        )
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit_plain(message, text)))
+
+    try:
+        await message.edit_text(
+            "🧭 بدأت فهرسة الملفات الموجودة في Auto Downloads ومجلداتها الفرعية. "
+            "قد تستغرق وقتًا حسب عدد الملفات وأحجامها."
+        )
+        stats = await asyncio.to_thread(index_existing_drive_files, progress)
+        await message.edit_text(
+            "✅ انتهت فهرسة الملفات القديمة.\n\n"
+            f"📄 تمت مراجعة: {stats['seen']}\n"
+            f"🔐 أُضيفت بصمات جديدة: {stats['indexed']}\n"
+            f"♻️ كانت مفهرسة: {stats['already_indexed']}\n"
+            f"📑 ملفات Google الأصلية المتجاوزة: {stats['skipped_native']}\n"
+            f"⚠️ أخطاء: {stats['errors']}\n"
+            f"📦 البيانات المفحوصة: {human_size(stats['bytes_hashed'])}\n\n"
+            "ستُستخدم البصمات الجديدة في منع تكرار المحتوى."
+        )
+    except Exception as exc:
+        logger.exception("Drive inventory indexing failed")
+        await message.edit_text(f"❌ تعذرت فهرسة الملفات: {str(exc)[:300]}")
+    finally:
+        indexing_in_progress = False
+
+
+async def safe_edit_plain(message, text):
+    try:
+        await message.edit_text(text)
+    except Exception as exc:
+        logger.debug("Status message update skipped: %s", exc)
+
+
+async def cmd_index(update, context):
+    global indexing_in_progress
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    if indexing_in_progress:
+        await update.message.reply_text("الفهرسة جارية بالفعل. راجع رسالة التقدم السابقة.")
+        return
+    indexing_in_progress = True
+    message = await update.message.reply_text("🧭 جارٍ تجهيز فهرسة Drive...")
+    context.application.create_task(
+        run_drive_index(message),
+        name="drive-inventory-index",
+    )
+
 
 async def cmd_status(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -1498,6 +1660,7 @@ async def configure_bot_menu(application):
         BotCommand("colab", "فتح دفتر Google Colab"),
         BotCommand("cancel", "إلغاء مهمة"),
         BotCommand("retry", "إعادة محاولة مهمة فاشلة"),
+        BotCommand("index", "فهرسة الملفات القديمة ومنع تكرارها"),
     ]
     await application.bot.set_my_commands(commands)
     # Telegram's native menu can show commands; a direct URL requires a Mini App.
@@ -1555,6 +1718,7 @@ def main():
     app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("retry", cmd_retry))
+    app.add_handler(CommandHandler("index", cmd_index))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=False)
