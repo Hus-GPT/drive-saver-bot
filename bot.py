@@ -9,7 +9,7 @@ import shutil
 import json
 from pathlib import Path
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -703,9 +703,23 @@ async def handle_telegram_file(update, context, file_obj):
         cancel_flags.pop(task_id, None)
         active_tasks.pop(task_id, None)
 
+async def configure_bot_menu(application):
+    commands = [
+        BotCommand("start", "بدء استخدام البوت"),
+        BotCommand("help", "المساعدة"),
+        BotCommand("queue", "العمليات الجارية والمنتظرة"),
+        BotCommand("status", "حالة البوت ومساحة Colab"),
+        BotCommand("colab", "فتح دفتر Google Colab"),
+        BotCommand("cancel", "إلغاء مهمة"),
+    ]
+    await application.bot.set_my_commands(commands)
+    # Telegram's native menu can show commands; a direct URL requires a Mini App.
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
 def main():
     logger.info("🚀 Starting DriveSaverBot inside Google Colab...")
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(4).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(2).post_init(configure_bot_menu).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
