@@ -713,6 +713,14 @@ async def cmd_retry(update, context):
             "أرسل الرابط مجددًا لأسباب أمنية."
         )
         return
+    if record.get("url"):
+        url = record["url"]
+        duplicate = find_duplicate_url_task(url)
+        if duplicate:
+            await update.message.reply_text(
+                f"هذه المهمة موجودة بالفعل في قائمة العمل: {duplicate['task_id']}."
+            )
+            return
     persist_task({
         "task_id": target,
         "user_id": OWNER_ID,
@@ -725,14 +733,6 @@ async def cmd_retry(update, context):
         "status": "retry_scheduled",
         "retry_scheduled_at": time.time(),
     })
-    if record.get("url"):
-        url = record["url"]
-        duplicate = find_duplicate_url_task(url)
-        if duplicate:
-            await update.message.reply_text(
-                f"هذه المهمة موجودة بالفعل في قائمة العمل: {duplicate['task_id']}."
-            )
-            return
         message = await update.message.reply_text(f"🔁 إعادة محاولة المهمة {target}...")
         info = {"is_video": True} if record.get("is_video") else None
         fake_update = SimpleNamespace(effective_user=update.effective_user)
@@ -741,6 +741,18 @@ async def cmd_retry(update, context):
             name=f"retry-download-{target}",
         )
         return
+    persist_task({
+        "task_id": target,
+        "user_id": OWNER_ID,
+        "url": record.get("url"),
+        "file_id": record.get("file_id"),
+        "file_name": record.get("file_name"),
+        "file_unique_id": record.get("file_unique_id"),
+        "quality": record.get("quality"),
+        "is_video": record.get("is_video", False),
+        "status": "retry_scheduled",
+        "retry_scheduled_at": time.time(),
+    })
     fake_message = SimpleNamespace(reply_text=update.message.reply_text)
     fake_update = SimpleNamespace(
         effective_user=update.effective_user,
