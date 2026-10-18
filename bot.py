@@ -502,7 +502,8 @@ async def cmd_help(update, context):
         "📖 *المساعدة*\n\n"
         "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
         "📎 أرسل ملفاً → يُحفظ في Drive\n"
-        "📋 /queue — العمليات الجارية والمنتظرة\n"\n        "📈 /progress — لوحة تقدم قابلة للتحديث لكل مهمة\n"
+        "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📈 /progress — لوحة تقدم قابلة للتحديث لكل مهمة\n"
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
         "📒 /colab — فتح دفتر Google Colab\n"
@@ -713,7 +714,7 @@ async def handle_callback(update, context):
         lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
         lines.extend(format_task_progress(task) for task in tasks[:8])
         await q.edit_message_text(
-            "\\n\\n".join(lines),
+            "\n\n".join(lines),
             reply_markup=build_progress_keyboard(tasks),
             disable_web_page_preview=True,
         )
