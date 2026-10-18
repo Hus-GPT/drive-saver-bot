@@ -938,7 +938,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
     await transfer_semaphore.acquire()
     queued_tasks.pop(task_id, None)
     if cancel_flags.get(task_id, False):
-        persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+        persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "cancelled"})
         cancel_flags.pop(task_id, None)
         transfer_semaphore.release()
         await msg.edit_text(f"🛑 أُلغيت المهمة {task_id} قبل بدء النقل.")
@@ -948,7 +948,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
         "status": "تنزيل", "started_at": started,
     }
     persist_task({
-        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "quality": quality,
         "is_video": is_video, "status": "started", "started_at": started,
     })
 
@@ -994,17 +994,17 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
             except Exception as exc:
                 if "__CANCELLED__" in str(exc):
                     await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
-                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+                    persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "cancelled"})
                     return
                 if info and info.get("is_video") and is_rate_limit_error(exc) and is_youtube_url(url):
                     await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429). جرّب لاحقًا.")
-                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:400]})
+                    persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:400]})
                     return
                 raise
 
             if cancelled():
                 await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
-                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+                persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "cancelled"})
                 return
             if not file_path or not os.path.isfile(file_path):
                 raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
@@ -1019,7 +1019,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                     result = await asyncio.to_thread(upload_to_drive, extracted_path, None, cancelled)
                     results.append(result)
                     persist_task({
-                        "task_id": task_id, "user_id": uid, "url": url,
+                        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url,
                         "name": result["name"], "size": extracted_size,
                         "drive_file_id": result["id"], "drive_link": result["link"],
                         "status": "archive_member_completed",
@@ -1029,7 +1029,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                     f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
                     for item in results
                 )
-                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
+                persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
                 await msg.edit_text(
                     f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
                     disable_web_page_preview=True,
@@ -1037,7 +1037,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                 return
             size = os.path.getsize(file_path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
-            persist_task({"task_id": task_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
+            persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
             upload_started = time.time()
             upload_sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
 
@@ -1060,7 +1060,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
             result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress, cancelled)
             elapsed = time.time() - started
             persist_task({
-                "task_id": task_id, "user_id": uid, "url": url,
+                "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url,
                 "name": result["name"], "size": size, "status": "completed",
                 "drive_file_id": result["id"], "drive_link": result["link"],
                 "elapsed_seconds": round(elapsed, 2),
@@ -1080,14 +1080,14 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
             )
     except Exception as exc:
         if "__CANCELLED__" in str(exc) or cancelled():
-            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+            persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "cancelled"})
             try:
                 await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
             except Exception:
                 pass
         else:
             logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
-            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
+            persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
             try:
                 await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
             except Exception:
@@ -1152,7 +1152,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
     await transfer_semaphore.acquire()
     queued_tasks.pop(task_id, None)
     if cancel_flags.get(task_id, False):
-        persist_task({"task_id": task_id, "user_id": uid, "file_id": file_obj.file_id, "status": "cancelled"})
+        persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_id": file_obj.file_id, "status": "cancelled"})
         cancel_flags.pop(task_id, None)
         transfer_semaphore.release()
         await update.message.reply_text("🛑 أُلغيت المهمة قبل بدء النقل.")
@@ -1164,7 +1164,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
         "started_at": started,
     }
     persist_task({
-        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_id": file_obj.file_id,
         "file_name": getattr(file_obj, "file_name", None),
         "file_unique_id": getattr(file_obj, "file_unique_id", None),
         "status": "telegram_download_started", "started_at": started,
@@ -1189,7 +1189,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
                     result = await asyncio.to_thread(upload_to_drive, extracted_path, None, lambda: cancel_flags.get(task_id, False))
                     results.append(result)
                     persist_task({
-                        "task_id": task_id, "user_id": uid, "file_name": Path(extracted_path).name,
+                        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_name": Path(extracted_path).name,
                         "size": extracted_size, "drive_file_id": result["id"],
                         "drive_link": result["link"], "status": "archive_member_completed",
                         "already_exists": result.get("already_exists", False),
@@ -1198,7 +1198,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
                     f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
                     for item in results
                 )
-                persist_task({"task_id": task_id, "user_id": uid, "status": "completed", "archive": True, "extracted_count": len(results)})
+                persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "status": "completed", "archive": True, "extracted_count": len(results)})
                 await msg.edit_text(
                     f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
                     disable_web_page_preview=True,
@@ -1207,7 +1207,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
             size = os.path.getsize(path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
             persist_task({
-                "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+                "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_id": file_obj.file_id,
                 "file_name": name, "file_unique_id": getattr(file_obj, "file_unique_id", None),
                 "size": size, "status": "uploading_telegram",
             })
@@ -1230,7 +1230,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
             result = await asyncio.to_thread(upload_to_drive, path, upload_progress, lambda: cancel_flags.get(task_id, False))
             elapsed = time.time() - started
             persist_task({
-                "task_id": task_id, "user_id": uid, "name": result["name"], "size": size,
+                "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "name": result["name"], "size": size,
                 "status": "completed", "drive_file_id": result["id"], "drive_link": result["link"],
                 "elapsed_seconds": round(elapsed, 2),
             })
@@ -1241,7 +1241,7 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
             )
     except Exception as exc:
         logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
-        persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
+        persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
         try:
             if msg is not None:
                 await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
