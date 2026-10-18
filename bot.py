@@ -708,12 +708,13 @@ async def cmd_retry(update, context):
     if record.get("status") != "failed":
         await update.message.reply_text("يمكن إعادة محاولة المهام الفاشلة فقط. تحقق من /queue ومن سجل المهمة.")
         return
-    if record.get("recovery_requires_manual_url") or not record.get("url") and not record.get("file_id"):
+    if record.get("recovery_requires_manual_url") or (not record.get("url") and not record.get("file_id")):
         await update.message.reply_text(
-            "لا يمكن إعادة هذه المهمة تلقائيًا لأن رابطها يحتوي بيانات وصول حساسة أو لم يُحفظ رابط قابل للاستعادة. "
+            "لا يمكن إعادة هذه المهمة تلقائيًا لأن رابطها يحتوي بيانات وصول حساسة أو لم يُحفظ مرجع قابل للاستعادة. "
             "أرسل الرابط مجددًا لأسباب أمنية."
         )
         return
+
     if record.get("url"):
         url = record["url"]
         duplicate = find_duplicate_url_task(url)
@@ -722,18 +723,11 @@ async def cmd_retry(update, context):
                 f"هذه المهمة موجودة بالفعل في قائمة العمل: {duplicate['task_id']}."
             )
             return
-    persist_task({
-        "task_id": target,
-        "user_id": OWNER_ID,
-        "url": record.get("url"),
-        "file_id": record.get("file_id"),
-        "file_name": record.get("file_name"),
-        "file_unique_id": record.get("file_unique_id"),
-        "quality": record.get("quality"),
-        "is_video": record.get("is_video", False),
-        "status": "retry_scheduled",
-        "retry_scheduled_at": time.time(),
-    })
+        persist_task({
+            "task_id": target, "user_id": OWNER_ID, "url": url,
+            "quality": record.get("quality"), "is_video": record.get("is_video", False),
+            "status": "retry_scheduled", "retry_scheduled_at": time.time(),
+        })
         message = await update.message.reply_text(f"🔁 إعادة محاولة المهمة {target}...")
         info = {"is_video": True} if record.get("is_video") else None
         fake_update = SimpleNamespace(effective_user=update.effective_user)
@@ -742,17 +736,16 @@ async def cmd_retry(update, context):
             name=f"retry-download-{target}",
         )
         return
+
+    file_unique_id = record.get("file_unique_id")
+    duplicate_id = find_duplicate_telegram_task(file_unique_id)
+    if duplicate_id:
+        await update.message.reply_text(f"هذا الملف قيد المعالجة بالفعل ضمن المهمة {duplicate_id}.")
+        return
     persist_task({
-        "task_id": target,
-        "user_id": OWNER_ID,
-        "url": record.get("url"),
-        "file_id": record.get("file_id"),
-        "file_name": record.get("file_name"),
-        "file_unique_id": record.get("file_unique_id"),
-        "quality": record.get("quality"),
-        "is_video": record.get("is_video", False),
-        "status": "retry_scheduled",
-        "retry_scheduled_at": time.time(),
+        "task_id": target, "user_id": OWNER_ID, "file_id": record.get("file_id"),
+        "file_name": record.get("file_name"), "file_unique_id": file_unique_id,
+        "status": "retry_scheduled", "retry_scheduled_at": time.time(),
     })
     fake_message = SimpleNamespace(reply_text=update.message.reply_text)
     fake_update = SimpleNamespace(
@@ -761,16 +754,16 @@ async def cmd_retry(update, context):
         message=fake_message,
     )
     fake_file = SimpleNamespace(
-        file_id=record["file_id"],
-        file_size=record.get("size", 0),
-        file_name=record.get("file_name"),
-        file_unique_id=record.get("file_unique_id", target),
+        file_id=record["file_id"], file_size=record.get("size", 0),
+        file_name=record.get("file_name"), file_unique_id=file_unique_id or target,
     )
     context.application.create_task(
         handle_telegram_file(fake_update, context.application, fake_file),
         name=f"retry-telegram-{target}",
     )
     await update.message.reply_text(f"🔁 أُعيدت جدولة ملف Telegram من المهمة {target}.")
+
+
 
 
 async def cmd_cancel(update, context):
