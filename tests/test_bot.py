@@ -309,6 +309,58 @@ class TransferTests(unittest.TestCase):
             self.assertNotIn(archive_path, extracted)
             self.assertEqual(open(extracted[0], encoding="utf-8").read(), "hello")
 
+    def test_7z_archive_extracts_nested_files_without_returning_archive(self):
+        import py7zr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = os.path.join(tmp, "source")
+            os.makedirs(os.path.join(source_dir, "docs"))
+            source_file = os.path.join(source_dir, "docs", "readme.txt")
+            with open(source_file, "w", encoding="utf-8") as handle:
+                handle.write("hello from 7z")
+            archive_path = os.path.join(tmp, "bundle.7z")
+            with py7zr.SevenZipFile(archive_path, mode="w") as archive:
+                archive.write(source_file, arcname="docs/readme.txt")
+
+            extracted = bot.extract_archive_contents(archive_path, tmp)
+            self.assertEqual(len(extracted), 1)
+            self.assertNotIn(archive_path, extracted)
+            self.assertTrue(os.path.isfile(extracted[0]))
+            with open(extracted[0], encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "hello from 7z")
+            self.assertEqual(
+                os.path.relpath(extracted[0], os.path.join(tmp, "extracted_bundle")),
+                os.path.join("docs", "readme.txt"),
+            )
+
+    def test_social_video_url_is_sent_to_ytdlp_even_if_path_looks_like_media(self):
+        class FakeYDL:
+            def __init__(self, options):
+                self.options = options
+                self.requested_url = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=False):
+                self.requested_url = url
+                return {
+                    "title": "Test post",
+                    "formats": [{"vcodec": "h264"}],
+                    "extractor_key": "Instagram",
+                }
+
+        url = "https://www.instagram.com/p/example.mp4"
+        fake = FakeYDL({})
+        with patch.object(bot.yt_dlp, "YoutubeDL", return_value=fake) as factory:
+            info = bot.fetch_url_info(url)
+        factory.assert_called_once()
+        self.assertTrue(info["is_video"])
+        self.assertEqual(fake.requested_url, url)
+
     def test_zip_archive_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = os.path.join(tmp, "unsafe.zip")

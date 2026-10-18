@@ -5,3 +5,4 @@ yt-dlp[default]
 bgutil-ytdlp-pot-provider==2.0.0
 requests
 rarfile==4.2
+py7zr>=0.22,<2

@@ -10,6 +10,7 @@ import json
 import hashlib
 import re
 import zipfile
+import py7zr
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import posixpath
 from types import SimpleNamespace
@@ -120,7 +121,7 @@ def sha256_file(file_path):
 
 
 
-ARCHIVE_EXTENSIONS = {".zip", ".rar"}
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z"}
 MAX_ARCHIVE_MEMBERS = 5000
 MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024 * 1024
 
@@ -141,7 +142,7 @@ def _safe_archive_target(root, member_name):
 
 
 def extract_archive_contents(file_path, work_dir):
-    """Extract ZIP/RAR safely; return extracted files, or None for non-archives."""
+    """Extract ZIP/RAR/7z safely; return extracted files, or None for non-archives."""
     source = Path(file_path)
     suffix = source.suffix.lower()
     if suffix not in ARCHIVE_EXTENSIONS:
@@ -160,7 +161,6 @@ def extract_archive_contents(file_path, work_dir):
             for info in infos:
                 if info.is_dir():
                     continue
-                # Reject Unix symlinks in ZIP metadata.
                 mode = (info.external_attr >> 16) & 0o170000
                 if mode == 0o120000:
                     continue
@@ -172,6 +172,35 @@ def extract_archive_contents(file_path, work_dir):
                 with archive.open(info, "r") as src, target.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
                 members.append(str(target))
+    elif suffix == ".7z":
+        try:
+            with py7zr.SevenZipFile(source, mode="r") as archive:
+                infos = archive.list()
+                if len(infos) > MAX_ARCHIVE_MEMBERS:
+                    raise RuntimeError(f"الأرشيف يحتوي على أكثر من {MAX_ARCHIVE_MEMBERS} عنصر.")
+                safe_names = []
+                for info in infos:
+                    name = getattr(info, "filename", "")
+                    if getattr(info, "is_directory", False):
+                        continue
+                    if getattr(info, "is_symlink", False):
+                        continue
+                    target = _safe_archive_target(extract_root, name)
+                    expanded_bytes += int(getattr(info, "uncompressed", 0) or 0)
+                    if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                        raise RuntimeError("حجم الملفات بعد فك الأرشيف يتجاوز الحد الآمن 50 GiB.")
+                    safe_names.append(name)
+                if safe_names:
+                    # py7zr performs extraction only for names already validated above.
+                    archive.extract(path=extract_root, targets=safe_names)
+                    for name in safe_names:
+                        target = _safe_archive_target(extract_root, name)
+                        if target.is_file():
+                            members.append(str(target))
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"تعذر فك أرشيف 7z: {str(exc)[:250]}") from exc
     else:
         try:
             with rarfile.RarFile(source) as archive:
@@ -481,7 +510,9 @@ def ytdlp_opts(extra=None):
 
 
 def fetch_url_info(url):
-    if is_likely_direct_file_url(url):
+    # Social/video post URLs must go through yt-dlp even when their path looks
+    # like a media filename; platform pages are not generic file endpoints.
+    if is_likely_direct_file_url(url) and not is_video_platform_url(url):
         return {"is_video": False, "url": url, "direct_file": True}
     try:
         with yt_dlp.YoutubeDL(ytdlp_opts({"skip_download": True})) as ydl:
@@ -1234,7 +1265,7 @@ async def handle_link(update, context, url):
     info = await fetch_url_info_safe(url)
     if not info.get("is_video"):
         if info.get("rate_limited") and info.get("youtube"):
-                        await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
+            await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
             return
         if info.get("error") and is_video_platform_url(url):
             # Metadata extraction can fail temporarily while the platform's direct
