@@ -1488,12 +1488,24 @@ async def handle_link(update, context, url):
             await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
             return
         if info.get("error") and is_video_platform_url(url):
-            # Metadata extraction can fail temporarily while the platform's direct
-            # media extractor still works. Never send a failed social-video URL
-            # to the generic requests downloader as if it were a file URL.
-            await msg.edit_text("⚠️ تعذّر جلب تفاصيل المنشور؛ سأحاول تنزيل أعلى جودة متاحة مباشرةً. قد تفشل المحاولة إذا كانت المنصة تتطلب تسجيل الدخول أو تمنع الطلب.")
-            fallback_info = {"is_video": True, "title": "Video", "formats": []}
-            await do_download(update, context, msg, url, "best", fallback_info)
+            # If metadata lookup fails, never silently choose the highest quality.
+            # Keep the user's explicit quality choice even for fallback attempts.
+            sid = uuid.uuid4().hex[:10]
+            fallback_info = {
+                "is_video": True, "title": "Video", "formats": [],
+                "is_playlist": is_youtube_playlist_url(url),
+            }
+            pending_downloads[sid] = {
+                "url": url, "info": fallback_info,
+                "user_id": update.effective_user.id,
+                "chat_id": update.effective_chat.id,
+                "message_id": msg.message_id, "created_at": time.time(),
+            }
+            await msg.edit_text(
+                "⚠️ تعذّر جلب تفاصيل المصدر. يمكنك اختيار الجودة يدويًا للمحاولة؛ "
+                "قد يفشل التنزيل إذا كانت المنصة تتطلب تسجيل الدخول أو تمنع الطلب.",
+                reply_markup=build_quality_keyboard(sid, []),
+            )
             return
         await msg.edit_text("📥 رابط مباشر — جارٍ التحميل...")
         await do_download(update, context, msg, url, None, None)
