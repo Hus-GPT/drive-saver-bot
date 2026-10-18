@@ -25,7 +25,7 @@ import yt_dlp
 import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BOT_PASSWORD = os.environ["BOT_PASSWORD"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
@@ -274,38 +274,43 @@ async def fetch_url_info_safe(url):
 
 
 async def cmd_start(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text("👋 أهلاً بك في *DriveSaverBot*!\n\n🔐 أرسل كلمة السر للمتابعة.", parse_mode="Markdown")
 
 
 async def cmd_help(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text("📖 *المساعدة*\n\n🔗 أرسل رابطاً → اختر الجودة → يُحفظ في Drive\n📎 أرسل ملفاً → يُحفظ في Drive\n🛑 /cancel — إلغاء التحميل الحالي\n🆔 /id — معرف المحادثة", parse_mode="Markdown")
 
 
 async def cmd_id(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text(f"🆔 `{update.effective_chat.id}`", parse_mode="Markdown")
 
 
 async def cmd_stats(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     uid = update.effective_user.id
     pending = sum(1 for p in pending_downloads.values() if p["user_id"] == uid)
     await update.message.reply_text(f"📊 *إحصائياتك*\n\n👤 معرّفك: `{uid}`\n🔄 تحميلات معلقة: {pending}\n✅ المصادقة: {'نعم' if uid in authenticated_users else 'لا'}", parse_mode="Markdown")
 
 
 async def cmd_cancel(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     cancel_flags[update.effective_user.id] = True
     await update.message.reply_text("🛑 جارٍ الإلغاء...")
 
 
 async def handle_message(update, context):
-    uid = update.effective_user.id
-    if uid not in authenticated_users:
-        text = (update.message.text or "").strip()
-        if text == BOT_PASSWORD:
-            authenticated_users.add(uid)
-            await update.message.reply_text("✅ تم التحقق!\n\nأرسل أي رابط أو ملف.\nاستخدم /help للمساعدة.")
-        else:
-            await update.message.reply_text("❌ كلمة سر خاطئة.")
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
+    uid = update.effective_user.id
+    authenticated_users.add(uid)
     if update.message.document or update.message.video or update.message.audio:
         await handle_telegram_file(update, context, update.message.document or update.message.video or update.message.audio)
         return
@@ -333,6 +338,9 @@ async def handle_link(update, context, url):
 
 async def handle_callback(update, context):
     q = update.callback_query
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        await q.answer("غير مصرح لك باستخدام هذا البوت.", show_alert=True)
+        return
     await q.answer()
     data = q.data
     uid = update.effective_user.id
@@ -483,7 +491,7 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=True)
 
 
