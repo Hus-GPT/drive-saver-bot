@@ -11,7 +11,7 @@ import hashlib
 import re
 from types import SimpleNamespace
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlunsplit
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
 from telegram.ext import (
     Application,
@@ -59,11 +59,20 @@ youtube_last_request = 0.0
 
 
 def persist_task(record):
-    """Append task history to Drive without storing credentials or tokens."""
+    """Append task history, redacting URLs whose query strings contain credentials."""
     try:
         path = Path(TASK_LOG_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(record)
+        url = payload.get("url")
+        if url:
+            parsed = urlparse(url)
+            query_keys = [key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+            sensitive_terms = ("token", "signature", "secret", "password", "auth", "credential", "session", "jwt", "key")
+            if any(term in key for key in query_keys for term in sensitive_terms):
+                payload.pop("url", None)
+                payload["url_redacted"] = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+                payload["recovery_requires_manual_url"] = True
         payload.setdefault("recorded_at", time.time())
         with TASK_LOG_LOCK, path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
