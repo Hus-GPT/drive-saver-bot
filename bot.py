@@ -7,6 +7,8 @@ import asyncio
 import threading
 import shutil
 import json
+import hashlib
+from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
@@ -47,7 +49,9 @@ logger = logging.getLogger(__name__)
 
 authenticated_users = set()
 pending_downloads = {}
+queued_tasks = {}
 active_tasks = {}
+transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '2'))))
 cancel_flags = {}
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
@@ -89,20 +93,46 @@ def get_drive_service():
 drive_service = None
 
 
+def sha256_file(file_path):
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
-    """Resumable upload with an explicit chunk size and server-side size verification."""
+    """Avoid duplicate uploads, use resumable chunks, and verify the saved file."""
     expected_size = os.path.getsize(file_path)
-    metadata = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
-    media = MediaFileUpload(
-        file_path,
-        resumable=True,
-        chunksize=DRIVE_UPLOAD_CHUNK_BYTES,
-    )
+    fingerprint = sha256_file(file_path)
     service = drive_service or get_drive_service()
+    query = (
+        f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and "
+        f"appProperties has {{ key='sha256' and value='{fingerprint}' }}"
+    )
+    existing = service.files().list(
+        q=query, pageSize=1, fields="files(id, name, size, webViewLink, appProperties)"
+    ).execute(num_retries=3).get("files", [])
+    for item in existing:
+        if int(item.get("size", -1)) == expected_size:
+            if progress_cb:
+                progress_cb(expected_size, expected_size)
+            return {
+                "id": item["id"], "link": item.get("webViewLink"),
+                "name": item.get("name") or Path(file_path).name,
+                "size": expected_size, "already_exists": True,
+            }
+
+    metadata = {
+        "name": Path(file_path).name,
+        "parents": [DRIVE_FOLDER_ID],
+        "appProperties": {"sha256": fingerprint},
+    }
+    media = MediaFileUpload(
+        file_path, resumable=True, chunksize=DRIVE_UPLOAD_CHUNK_BYTES
+    )
     request = service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id, webViewLink, name, size",
+        body=metadata, media_body=media, fields="id, webViewLink, name, size, appProperties"
     )
     response = None
     while response is None:
@@ -114,19 +144,21 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
     if not response or not response.get("id"):
         raise RuntimeError("Google Drive لم يُرجع معرّف الملف بعد الرفع.")
     verified = service.files().get(
-        fileId=response["id"],
-        fields="id, webViewLink, name, size",
+        fileId=response["id"], fields="id, webViewLink, name, size, appProperties"
     ).execute(num_retries=3)
     actual_size = int(verified.get("size", -1))
     if actual_size != expected_size:
         raise RuntimeError(
             f"فشل التحقق من الملف في Drive: المتوقع {expected_size} بايت، الموجود {actual_size} بايت."
         )
+    if (verified.get("appProperties") or {}).get("sha256") != fingerprint:
+        raise RuntimeError("فشل التحقق من بصمة المحتوى بعد الرفع.")
     return {
         "id": verified.get("id"),
         "link": verified.get("webViewLink") or response.get("webViewLink"),
         "name": verified.get("name") or Path(file_path).name,
         "size": actual_size,
+        "already_exists": False,
     }
 
 
@@ -355,14 +387,22 @@ async def cmd_queue(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
     running = list(active_tasks.values())
+    queued = list(queued_tasks.values())
     waiting = [item for item in pending_downloads.values() if item.get("user_id") == OWNER_ID]
-    lines = ["📋 *حالة العمليات*", f"🔄 نشطة: {len(running)}", f"⏳ تنتظر اختيار الجودة: {len(waiting)}"]
+    lines = [
+        "📋 حالة العمليات",
+        f"🔄 نشطة: {len(running)}",
+        f"⏳ في طابور التنفيذ: {len(queued)}",
+        f"🎬 تنتظر اختيار الجودة: {len(waiting)}",
+    ]
     for item in running[:10]:
         label = item.get("name") or item.get("url", "ملف")
         lines.append(f"• {item['id']} — {item.get('status', 'قيد التنفيذ')} — {label[:60]}")
+    for item in queued[:10]:
+        lines.append(f"• {item['id']} — انتظار — {item.get('url', 'ملف')[:70]}")
     for item in waiting[:10]:
-        lines.append(f"• بانتظار الاختيار — {item.get('url', 'رابط')[:70]}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+        lines.append(f"• بانتظار اختيار الجودة — {item.get('url', 'رابط')[:70]}")
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
 async def cmd_status(update, context):
@@ -411,19 +451,21 @@ async def cmd_cancel(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
     target = context.args[0] if context.args else None
+    pool = {**queued_tasks, **active_tasks}
     matches = [
-        task_id for task_id, task in active_tasks.items()
+        task_id for task_id, task in pool.items()
         if task.get("user_id") == OWNER_ID and (target is None or task_id == target)
     ]
     if target and not matches:
-        await update.message.reply_text("لم أجد مهمة نشطة بهذا الرقم. استخدم /queue لعرض أرقام المهام.")
+        await update.message.reply_text("لم أجد مهمة بهذا الرقم. استخدم /queue لعرض أرقام المهام.")
         return
     if not matches:
-        await update.message.reply_text("لا توجد عمليات نشطة لإلغائها.")
+        await update.message.reply_text("لا توجد عمليات لإلغائها.")
         return
     for task_id in matches:
         cancel_flags[task_id] = True
     await update.message.reply_text("🛑 طُلب إلغاء: " + ", ".join(matches))
+
 
 async def handle_message(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -505,12 +547,32 @@ async def do_download(update, context, msg, url, quality, info):
     started = time.time()
     loop = asyncio.get_running_loop()
     sample = {"time": started, "bytes": 0, "last_edit": 0.0}
+    queued_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "url": url, "status": "في الانتظار",
+        "started_at": started,
+    }
+    cancel_flags[task_id] = False
+    is_video = bool(info and info.get("is_video"))
+    persist_task({
+        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "is_video": is_video, "status": "queued", "started_at": started,
+    })
+    await transfer_semaphore.acquire()
+    queued_tasks.pop(task_id, None)
+    if cancel_flags.get(task_id, False):
+        persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+        cancel_flags.pop(task_id, None)
+        transfer_semaphore.release()
+        await msg.edit_text(f"🛑 أُلغيت المهمة {task_id} قبل بدء النقل.")
+        return
     active_tasks[task_id] = {
         "id": task_id, "user_id": uid, "url": url,
         "status": "تنزيل", "started_at": started,
     }
-    cancel_flags[task_id] = False
-    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "started", "started_at": started})
+    persist_task({
+        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "is_video": is_video, "status": "started", "started_at": started,
+    })
 
     def cancelled():
         return cancel_flags.get(task_id, False)
@@ -570,7 +632,7 @@ async def do_download(update, context, msg, url, quality, info):
                 raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
             size = os.path.getsize(file_path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
-            persist_task({"task_id": task_id, "user_id": uid, "url": url, "name": Path(file_path).name, "size": size, "status": "uploading"})
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
             upload_started = time.time()
             upload_sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
 
@@ -599,8 +661,12 @@ async def do_download(update, context, msg, url, quality, info):
                 "elapsed_seconds": round(elapsed, 2),
                 "average_bytes_per_second": round(size / elapsed, 2) if elapsed else 0,
             })
+            if result.get("already_exists"):
+                success_prefix = "♻️ *الملف موجود مسبقًا في Drive؛ لم أرفع نسخة مكررة.*"
+            else:
+                success_prefix = "✅ *تم الحفظ والتحقق في Drive!*"
             await msg.edit_text(
-                f"✅ *تم الحفظ والتحقق في Drive!*\n\n📁 [{result['name']}]({result['link']})"
+                f"{success_prefix}\n\n📁 [{result['name']}]({result['link']})"
                 f"\n💾 الحجم: {human_size(size)}\n⏱️ الوقت الكلي: {human_time(elapsed)}"
                 f"\n⚡ متوسط السرعة الكلية: {human_size(size / elapsed if elapsed else 0)}/s"
                 f"\n🆔 المهمة: {task_id}",
@@ -623,7 +689,9 @@ async def do_download(update, context, msg, url, quality, info):
                 pass
     finally:
         cancel_flags.pop(task_id, None)
+        queued_tasks.pop(task_id, None)
         active_tasks.pop(task_id, None)
+        transfer_semaphore.release()
 
 
 async def handle_telegram_file(update, context, file_obj):
@@ -703,6 +771,26 @@ async def handle_telegram_file(update, context, file_obj):
         cancel_flags.pop(task_id, None)
         active_tasks.pop(task_id, None)
 
+def latest_task_records():
+    latest = {}
+    path = Path(TASK_LOG_PATH)
+    if not path.exists():
+        return latest
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                    task_id = item.get("task_id")
+                    if task_id:
+                        latest[task_id] = item
+                except json.JSONDecodeError:
+                    continue
+    except OSError as exc:
+        logger.warning("Could not read task journal: %s", exc)
+    return latest
+
+
 async def configure_bot_menu(application):
     commands = [
         BotCommand("start", "بدء استخدام البوت"),
@@ -716,10 +804,37 @@ async def configure_bot_menu(application):
     # Telegram's native menu can show commands; a direct URL requires a Mini App.
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
+    latest = latest_task_records()
+    recoverable = [
+        item for item in latest.values()
+        if item.get("status") in {"queued", "started", "uploading"}
+        and item.get("url")
+    ]
+    for item in recoverable:
+        old_id = item.get("task_id")
+        url = item["url"]
+        info = {"is_video": True} if item.get("is_video") else None
+        try:
+            message = await application.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"♻️ استعادة مهمة انقطعت سابقًا: {url[:180]}",
+                disable_web_page_preview=True,
+            )
+            fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
+            asyncio.create_task(
+                do_download(fake_update, application, message, url, item.get("quality"), info)
+            )
+            persist_task({
+                "task_id": old_id, "user_id": OWNER_ID, "url": url,
+                "status": "recovery_scheduled", "recovered_as_new_task": True,
+            })
+        except Exception as exc:
+            logger.warning("Could not recover task %s: %s", old_id, exc)
+
 
 def main():
     logger.info("🚀 Starting DriveSaverBot inside Google Colab...")
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(2).post_init(configure_bot_menu).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(16).post_init(configure_bot_menu).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))

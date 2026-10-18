@@ -17,9 +17,10 @@ class FakeStatus:
 
 
 class FakeRequest:
-    def __init__(self, file_id, size):
+    def __init__(self, file_id, size, fingerprint="abc"):
         self.file_id = file_id
         self.size = size
+        self.fingerprint = fingerprint
         self.called = False
 
     def next_chunk(self, num_retries=0):
@@ -30,6 +31,7 @@ class FakeRequest:
                 "name": "sample.bin",
                 "webViewLink": "https://drive.google.com/file/d/" + self.file_id,
                 "size": str(self.size),
+                "appProperties": {"sha256": self.fingerprint},
             }
         raise AssertionError("next_chunk should finish after the first response")
 
@@ -39,18 +41,31 @@ class FakeFiles:
         self.size = size
         self.request = None
 
+    def list(self, q, pageSize, fields):
+        return FakeListRequest([])
+
     def create(self, body, media_body, fields):
-        self.request = FakeRequest("drive-id-1", self.size)
+        fingerprint = body.get("appProperties", {}).get("sha256", "abc")
+        self.request = FakeRequest("drive-id-1", self.size, fingerprint)
         return self.request
 
     def get(self, fileId, fields):
-        return FakeGetRequest(fileId, self.size)
+        return FakeGetRequest(fileId, self.size, "abc")
+
+
+class FakeListRequest:
+    def __init__(self, files):
+        self.files = files
+
+    def execute(self, num_retries=0):
+        return {"files": self.files}
 
 
 class FakeGetRequest:
-    def __init__(self, file_id, size):
+    def __init__(self, file_id, size, fingerprint="abc"):
         self.file_id = file_id
         self.size = size
+        self.fingerprint = fingerprint
 
     def execute(self, num_retries=0):
         return {
@@ -58,6 +73,7 @@ class FakeGetRequest:
             "name": "sample.bin",
             "webViewLink": "https://drive.google.com/file/d/" + self.file_id,
             "size": str(self.size),
+            "appProperties": {"sha256": self.fingerprint},
         }
 
 
@@ -77,8 +93,8 @@ class TransferTests(unittest.TestCase):
             service = FakeService(10)
             progress = []
             with patch.object(bot, "drive_service", service), patch.object(
-                bot, "MediaFileUpload", return_value=object()
-            ) as media_factory:
+                bot, "sha256_file", return_value="abc"
+            ), patch.object(bot, "MediaFileUpload", return_value=object()) as media_factory:
                 result = bot.upload_to_drive(handle.name, lambda done, total: progress.append((done, total)))
             self.assertEqual(result["id"], "drive-id-1")
             self.assertEqual(result["size"], 10)
@@ -92,8 +108,8 @@ class TransferTests(unittest.TestCase):
             handle.flush()
             service = FakeService(9)
             with patch.object(bot, "drive_service", service), patch.object(
-                bot, "MediaFileUpload", return_value=object()
-            ):
+                bot, "sha256_file", return_value="abc"
+            ), patch.object(bot, "MediaFileUpload", return_value=object()):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
 
