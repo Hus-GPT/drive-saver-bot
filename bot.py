@@ -9,6 +9,8 @@ import shutil
 import json
 import hashlib
 import re
+import zipfile
+import posixpath
 from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse, urlunsplit
@@ -27,6 +29,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import yt_dlp
 import requests
+import rarfile
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
@@ -109,6 +112,85 @@ def sha256_file(file_path):
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+
+ARCHIVE_EXTENSIONS = {".zip", ".rar"}
+MAX_ARCHIVE_MEMBERS = 5000
+MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024 * 1024
+
+
+def _safe_archive_target(root, member_name):
+    """Resolve an archive member without permitting absolute paths or traversal."""
+    normalized = member_name.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise RuntimeError(f"رفض مسار مطلق داخل الأرشيف: {member_name[:120]}")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise RuntimeError(f"رفض مسار غير آمن داخل الأرشيف: {member_name[:120]}")
+    target = (Path(root) / Path(*parts)).resolve()
+    base = Path(root).resolve()
+    if target != base and base not in target.parents:
+        raise RuntimeError(f"رفض مسار خارج مجلد الاستخراج: {member_name[:120]}")
+    return target
+
+
+def extract_archive_contents(file_path, work_dir):
+    """Extract ZIP/RAR safely; return extracted files, or None for non-archives."""
+    source = Path(file_path)
+    suffix = source.suffix.lower()
+    if suffix not in ARCHIVE_EXTENSIONS:
+        return None
+
+    extract_root = Path(work_dir) / ("extracted_" + re.sub(r"[^A-Za-z0-9_-]", "_", source.stem)[:80])
+    extract_root.mkdir(parents=True, exist_ok=True)
+    members = []
+    expanded_bytes = 0
+
+    if suffix == ".zip":
+        with zipfile.ZipFile(source) as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(f"الأرشيف يحتوي على أكثر من {MAX_ARCHIVE_MEMBERS} عنصر.")
+            for info in infos:
+                if info.is_dir():
+                    continue
+                # Reject Unix symlinks in ZIP metadata.
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    continue
+                target = _safe_archive_target(extract_root, info.filename)
+                expanded_bytes += int(info.file_size or 0)
+                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise RuntimeError("حجم الملفات بعد فك الأرشيف يتجاوز الحد الآمن 50 GiB.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info, "r") as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                members.append(str(target))
+    else:
+        try:
+            with rarfile.RarFile(source) as archive:
+                infos = archive.infolist()
+                if len(infos) > MAX_ARCHIVE_MEMBERS:
+                    raise RuntimeError(f"الأرشيف يحتوي على أكثر من {MAX_ARCHIVE_MEMBERS} عنصر.")
+                for info in infos:
+                    if info.is_dir():
+                        continue
+                    target = _safe_archive_target(extract_root, info.filename)
+                    expanded_bytes += int(getattr(info, "file_size", 0) or 0)
+                    if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                        raise RuntimeError("حجم الملفات بعد فك الأرشيف يتجاوز الحد الآمن 50 GiB.")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    members.append(str(target))
+        except rarfile.RarCannotExec as exc:
+            raise RuntimeError("تعذر فك RAR: أداة 7z غير متاحة. أعد تشغيل خلية إعداد Colab لتثبيتها.") from exc
+
+    if not members:
+        raise RuntimeError("الأرشيف لا يحتوي على ملفات قابلة للاستخراج.")
+    logger.info("Extracted %s files from archive %s", len(members), source.name)
+    return members
 
 
 def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
@@ -676,6 +758,33 @@ async def do_download(update, context, msg, url, quality, info):
                 return
             if not file_path or not os.path.isfile(file_path):
                 raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
+            extracted_paths = await asyncio.to_thread(extract_archive_contents, file_path, tmp)
+            if extracted_paths is not None:
+                results = []
+                for extracted_path in extracted_paths:
+                    if cancelled():
+                        raise RuntimeError("__CANCELLED__")
+                    extracted_size = os.path.getsize(extracted_path)
+                    active_tasks[task_id].update({"status": "رفع محتويات الأرشيف", "name": Path(extracted_path).name, "size": extracted_size})
+                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, cancelled)
+                    results.append(result)
+                    persist_task({
+                        "task_id": task_id, "user_id": uid, "url": url,
+                        "name": result["name"], "size": extracted_size,
+                        "drive_file_id": result["id"], "drive_link": result["link"],
+                        "status": "archive_member_completed",
+                        "already_exists": result.get("already_exists", False),
+                    })
+                links = "\\n".join(
+                    f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
+                    for item in results
+                )
+                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
+                await msg.edit_text(
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\\n\\n{links}",
+                    disable_web_page_preview=True,
+                )
+                return
             size = os.path.getsize(file_path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
             persist_task({"task_id": task_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
@@ -800,6 +909,31 @@ async def handle_telegram_file(update, context, file_obj):
         with tempfile.TemporaryDirectory(prefix="drive-saver-telegram-") as tmp:
             path = os.path.join(tmp, name)
             await tg.download_to_drive(path)
+            extracted_paths = await asyncio.to_thread(extract_archive_contents, path, tmp)
+            if extracted_paths is not None:
+                results = []
+                for extracted_path in extracted_paths:
+                    if cancel_flags.get(task_id, False):
+                        raise RuntimeError("__CANCELLED__")
+                    extracted_size = os.path.getsize(extracted_path)
+                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, lambda: cancel_flags.get(task_id, False))
+                    results.append(result)
+                    persist_task({
+                        "task_id": task_id, "user_id": uid, "file_name": Path(extracted_path).name,
+                        "size": extracted_size, "drive_file_id": result["id"],
+                        "drive_link": result["link"], "status": "archive_member_completed",
+                        "already_exists": result.get("already_exists", False),
+                    })
+                links = "\\n".join(
+                    f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
+                    for item in results
+                )
+                persist_task({"task_id": task_id, "user_id": uid, "status": "completed", "archive": True, "extracted_count": len(results)})
+                await msg.edit_text(
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\\n\\n{links}",
+                    disable_web_page_preview=True,
+                )
+                return
             size = os.path.getsize(path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
             persist_task({
