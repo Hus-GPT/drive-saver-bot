@@ -206,6 +206,32 @@ class TransferTests(unittest.TestCase):
         self.assertIn("لا توجد مهام نشطة", dashboard)
         self.assertIsNone(keyboard)
 
+    def test_duplicate_url_is_detected_in_active_and_queued_tasks(self):
+        task = {"id": "task123", "user_id": 123456, "url": "https://example.com/file.zip"}
+        with patch.dict(bot.active_tasks, {"task123": task}, clear=True), patch.dict(
+            bot.queued_tasks, {}, clear=True
+        ), patch.dict(bot.pending_downloads, {}, clear=True):
+            duplicate = bot.find_duplicate_url_task("https://example.com/file.zip")
+        self.assertEqual(duplicate["task_id"], "task123")
+        self.assertEqual(duplicate["kind"], "transfer")
+
+    def test_duplicate_url_waiting_for_quality_is_detected(self):
+        pending = {"url": "https://example.com/watch", "user_id": 123456}
+        with patch.dict(bot.active_tasks, {}, clear=True), patch.dict(
+            bot.queued_tasks, {}, clear=True
+        ), patch.dict(bot.pending_downloads, {"short1": pending}, clear=True):
+            duplicate = bot.find_duplicate_url_task("https://example.com/watch")
+        self.assertEqual(duplicate["task_id"], "short1")
+        self.assertEqual(duplicate["kind"], "quality")
+
+    def test_duplicate_telegram_file_is_detected(self):
+        task = {"id": "tg123", "user_id": 123456, "file_unique_id": "unique-file"}
+        with patch.dict(bot.active_tasks, {"tg123": task}, clear=True), patch.dict(
+            bot.queued_tasks, {}, clear=True
+        ):
+            self.assertEqual(bot.find_duplicate_telegram_task("unique-file"), "tg123")
+        self.assertIsNone(bot.find_duplicate_telegram_task(None))
+
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "tasks.jsonl")
