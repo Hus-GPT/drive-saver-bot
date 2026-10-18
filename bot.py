@@ -689,27 +689,27 @@ async def handle_callback(update, context):
     if data.startswith("task_cancel|"):
         task_id = data.split("|", 1)[1]
         if task_id not in active_tasks and task_id not in queued_tasks:
-            await q.answer("المهمة غير نشطة.", show_alert=True)
+            await q.message.reply_text("المهمة غير نشطة.")
             return
         cancel_flags[task_id] = True
-        await q.answer(f"طُلب إلغاء المهمة {task_id}.", show_alert=True)
+        await q.message.reply_text(f"🛑 طُلب إلغاء المهمة {task_id}.")
         await refresh_dashboard(context.bot, force=True)
         return
     if data.startswith("task_retry|"):
         task_id = data.split("|", 1)[1]
         spec = retry_task_specs.get(task_id)
         if not spec:
-            await q.answer("لا تتوفر بيانات كافية لإعادة هذه المهمة.", show_alert=True)
+            await q.message.reply_text("لا تتوفر بيانات كافية لإعادة هذه المهمة.")
             return
         if task_id in active_tasks or task_id in queued_tasks:
-            await q.answer("هذه المهمة ما زالت تعمل.", show_alert=True)
+            await q.message.reply_text("هذه المهمة ما زالت تعمل.")
             return
         retry_task_specs.pop(task_id, None)
         failed_tasks.pop(task_id, None)
         retry_message = await q.message.reply_text(f"🔁 إعادة محاولة المهمة {task_id}...")
         fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
         asyncio.create_task(do_download(fake_update, context, retry_message, spec["url"], spec.get("quality"), spec.get("info")))
-        await q.answer("بدأت إعادة المحاولة.")
+        await q.message.reply_text("🔁 بدأت إعادة المحاولة.")
         await refresh_dashboard(context.bot, force=True)
         return
     if data.startswith("large_cancel|"):
@@ -996,6 +996,14 @@ async def handle_telegram_file(update, context, file_obj):
                 parse_mode="Markdown", disable_web_page_preview=True,
             )
     except Exception as exc:
+        if "__CANCELLED__" in str(exc) or cancel_flags.get(task_id, False):
+            persist_task({"task_id": task_id, "user_id": uid, "status": "cancelled"})
+            try:
+                if msg is not None:
+                    await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+            except Exception:
+                pass
+            return
         logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
         persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
         try:
