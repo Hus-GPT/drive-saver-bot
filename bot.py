@@ -686,6 +686,68 @@ async def cmd_stats(update, context):
     await update.message.reply_text(f"📊 *إحصائياتك*\n\n👤 معرّفك: `{uid}`\n🔄 تحميلات معلقة: {pending}\n✅ المصادقة: {'نعم' if uid in authenticated_users else 'لا'}", parse_mode="Markdown")
 
 
+async def cmd_retry(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    latest = latest_task_records()
+    target = context.args[0] if context.args else None
+    if target:
+        record = latest.get(target)
+        if not record:
+            await update.message.reply_text("لم أجد سجلًا لهذه المهمة.")
+            return
+    else:
+        failed = [item for item in latest.values() if item.get("status") == "failed"]
+        failed.sort(key=lambda item: item.get("recorded_at", 0), reverse=True)
+        record = failed[0] if failed else None
+        if not record:
+            await update.message.reply_text("لا توجد مهام فاشلة محفوظة لإعادة المحاولة.")
+            return
+        target = record.get("task_id")
+    if record.get("status") != "failed":
+        await update.message.reply_text("يمكن إعادة محاولة المهام الفاشلة فقط. تحقق من /queue ومن سجل المهمة.")
+        return
+    if record.get("recovery_requires_manual_url") or not record.get("url") and not record.get("file_id"):
+        await update.message.reply_text(
+            "لا يمكن إعادة هذه المهمة تلقائيًا لأن رابطها يحتوي بيانات وصول حساسة أو لم يُحفظ رابط قابل للاستعادة. "
+            "أرسل الرابط مجددًا لأسباب أمنية."
+        )
+        return
+    if record.get("url"):
+        url = record["url"]
+        duplicate = find_duplicate_url_task(url)
+        if duplicate:
+            await update.message.reply_text(
+                f"هذه المهمة موجودة بالفعل في قائمة العمل: {duplicate['task_id']}."
+            )
+            return
+        message = await update.message.reply_text(f"🔁 إعادة محاولة المهمة {target}...")
+        info = {"is_video": True} if record.get("is_video") else None
+        fake_update = SimpleNamespace(effective_user=update.effective_user)
+        context.application.create_task(
+            do_download(fake_update, context.application, message, url, record.get("quality"), info),
+            name=f"retry-download-{target}",
+        )
+        return
+    fake_message = SimpleNamespace(reply_text=update.message.reply_text)
+    fake_update = SimpleNamespace(
+        effective_user=update.effective_user,
+        effective_chat=update.effective_chat,
+        message=fake_message,
+    )
+    fake_file = SimpleNamespace(
+        file_id=record["file_id"],
+        file_size=record.get("size", 0),
+        file_name=record.get("file_name"),
+        file_unique_id=record.get("file_unique_id", target),
+    )
+    context.application.create_task(
+        handle_telegram_file(fake_update, context.application, fake_file),
+        name=f"retry-telegram-{target}",
+    )
+    await update.message.reply_text(f"🔁 أُعيدت جدولة ملف Telegram من المهمة {target}.")
+
+
 async def cmd_cancel(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
@@ -726,7 +788,30 @@ async def handle_message(update, context):
     await update.message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
 
 
+def find_duplicate_url_task(url):
+    """Find an identical URL already waiting for quality selection or transfer."""
+    for task_id, task in {**active_tasks, **queued_tasks}.items():
+        if task.get("user_id") == OWNER_ID and task.get("url") == url:
+            return {"kind": "transfer", "task_id": task_id, "task": task}
+    for short_id, task in pending_downloads.items():
+        if task.get("user_id") == OWNER_ID and task.get("url") == url:
+            return {"kind": "quality", "task_id": short_id, "task": task}
+    return None
+
+
 async def handle_link(update, context, url):
+    duplicate = find_duplicate_url_task(url)
+    if duplicate:
+        if duplicate["kind"] == "quality":
+            await update.message.reply_text(
+                "♻️ هذا الرابط موجود بالفعل وينتظر اختيار الجودة. استخدم الرسالة السابقة لإكماله."
+            )
+        else:
+            await update.message.reply_text(
+                f"♻️ هذا الرابط قيد الانتظار أو التنزيل بالفعل.\n🆔 المهمة: {duplicate['task_id']}\n"
+                "لم أضف مهمة مكررة."
+            )
+        return
     msg = await update.message.reply_text("🔍 جلب معلومات الرابط...")
     info = await fetch_url_info_safe(url)
     if not info.get("is_video"):
@@ -1148,6 +1233,7 @@ async def configure_bot_menu(application):
         BotCommand("status", "حالة البوت ومساحة Colab"),
         BotCommand("colab", "فتح دفتر Google Colab"),
         BotCommand("cancel", "إلغاء مهمة"),
+        BotCommand("retry", "إعادة محاولة مهمة فاشلة"),
     ]
     await application.bot.set_my_commands(commands)
     # Telegram's native menu can show commands; a direct URL requires a Mini App.
@@ -1208,6 +1294,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("retry", cmd_retry))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
     app.run_polling(drop_pending_updates=False)
