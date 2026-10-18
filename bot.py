@@ -692,7 +692,7 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         # "best" deliberately has no height cap: yt-dlp selects the best available
         # video+audio streams and merges them. Numeric choices remain capped.
         if str(quality).lower() in {"best", "best_available", "max"}:
-            fmt = "bestvideo*+bestaudio/best"
+            fmt = "bestvideo+bestaudio/best"
         else:
             fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         pps = []
