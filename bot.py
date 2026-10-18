@@ -608,12 +608,19 @@ async def do_download(update, context, msg, url, quality, info):
                 disable_web_page_preview=True,
             )
     except Exception as exc:
-        logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
-        persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
-        try:
-            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
-        except Exception:
-            pass
+        if "__CANCELLED__" in str(exc) or cancelled():
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+            try:
+                await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+            except Exception:
+                pass
+        else:
+            logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
+            try:
+                await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
+            except Exception:
+                pass
     finally:
         cancel_flags.pop(task_id, None)
         active_tasks.pop(task_id, None)
@@ -644,6 +651,7 @@ async def handle_telegram_file(update, context, file_obj):
         "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
         "name": getattr(file_obj, "file_name", None), "started_at": started,
     }
+    cancel_flags[task_id] = False
     persist_task({"task_id": task_id, "user_id": uid, "status": "telegram_download_started", "started_at": started})
     msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\nالمهمة: {task_id}")
     try:
@@ -672,7 +680,7 @@ async def handle_telegram_file(update, context, file_obj):
                 text = f"📤 رفع إلى Drive: {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
-            result = await asyncio.to_thread(upload_to_drive, path, upload_progress)
+            result = await asyncio.to_thread(upload_to_drive, path, upload_progress, lambda: cancel_flags.get(task_id, False))
             elapsed = time.time() - started
             persist_task({
                 "task_id": task_id, "user_id": uid, "name": result["name"], "size": size,
@@ -692,6 +700,7 @@ async def handle_telegram_file(update, context, file_obj):
         except Exception:
             pass
     finally:
+        cancel_flags.pop(task_id, None)
         active_tasks.pop(task_id, None)
 
 app_flask = Flask(__name__)
