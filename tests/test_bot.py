@@ -43,6 +43,7 @@ class FakeFiles:
         self.request = None
 
     def list(self, q, pageSize, fields):
+        self.last_query = q
         return FakeListRequest(self.existing)
 
     def create(self, body, media_body, fields):
@@ -120,6 +121,25 @@ class TransferTests(unittest.TestCase):
                 result = bot.upload_to_drive(handle.name)
             self.assertTrue(result["already_exists"])
             self.assertEqual(result["id"], "existing-id")
+            media_factory.assert_not_called()
+
+    def test_duplicate_query_is_global_not_limited_to_destination_folder(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"0123456789")
+            handle.flush()
+            service = FakeService(10, [{
+                "id": "nested-existing-id",
+                "name": "sample.bin",
+                "size": "10",
+                "webViewLink": "https://drive.google.com/file/d/nested-existing-id",
+            }])
+            with patch.object(bot, "drive_service", service), patch.object(
+                bot, "sha256_file", return_value="abc"
+            ), patch.object(bot, "MediaFileUpload", return_value=object()) as media_factory:
+                result = bot.upload_to_drive(handle.name)
+            self.assertTrue(result["already_exists"])
+            self.assertNotIn("in parents", service.fake_files.last_query)
+            self.assertIn("appProperties", service.fake_files.last_query)
             media_factory.assert_not_called()
 
     def test_upload_fails_if_drive_size_does_not_match(self):
