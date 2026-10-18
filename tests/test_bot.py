@@ -616,6 +616,62 @@ class UnifiedIntakeTests(unittest.TestCase):
                     handle.write("# Netscape HTTP Cookie File\\n")
                 self.assertEqual(bot.ytdlp_opts()["cookiefile"], cookie_path)
 
+    def test_quality_keyboard_offers_best_available_and_8k_when_present(self):
+        formats = [
+            {"height": 4320, "vcodec": "av01", "acodec": "none"},
+            {"height": 1080, "vcodec": "avc1", "acodec": "none"},
+            {"height": 720, "vcodec": "none", "acodec": "mp4a"},
+        ]
+        class FakeButton:
+            def __init__(self, text, callback_data):
+                self.text, self.callback_data = text, callback_data
+        class FakeMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+        with patch.object(bot, "InlineKeyboardButton", FakeButton), patch.object(
+            bot, "InlineKeyboardMarkup", FakeMarkup
+        ):
+            markup = bot.build_quality_keyboard("abc123", formats)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("dl|abc123|best", callbacks)
+        self.assertIn("dl|abc123|4320", callbacks)
+        self.assertIn("dl|abc123|1080", callbacks)
+        self.assertIn("dl|abc123|720", callbacks)
+
+    def test_best_quality_download_does_not_apply_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "best")
+        self.assertEqual(captured["format"], "bestvideo*+bestaudio/best")
+
+    def test_numeric_quality_download_keeps_requested_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "720")
+        self.assertEqual(captured["format"], "bestvideo[height<=720]+bestaudio/best[height<=720]/best")
+
     def test_youtube_bot_challenge_is_recognized(self):
         self.assertTrue(bot.is_youtube_bot_challenge(
             "Sign in to confirm you're not a bot. Use --cookies-from-browser"
