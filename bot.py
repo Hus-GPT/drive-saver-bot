@@ -424,9 +424,35 @@ def human_time(s):
     return f"{h}:{m:02d}:{sec:02d} س"
 
 
+def extract_first_url(text):
+    """Extract the first URL from a shared message, ignoring trailing punctuation."""
+    for match in re.finditer(r"https?://[^\\s<>]+", text or "", re.IGNORECASE):
+        candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}）»”’")
+        parsed = urlparse(candidate)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return candidate
+    return None
+
+
 def is_youtube_url(url):
     u = url.lower()
     return "youtube.com/" in u or "youtu.be/" in u or "youtube-nocookie.com/" in u
+
+
+def is_video_platform_url(url):
+    """Recognize common video-post URLs, including TikTok's vm.tiktok.com short links."""
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
+        return True
+    return (
+        host in {"instagram.com", "facebook.com", "fb.watch", "youtube.com",
+                 "youtu.be", "youtube-nocookie.com", "vimeo.com", "reddit.com",
+                 "redd.it", "x.com", "twitter.com"}
+        or any(host.endswith("." + domain) for domain in (
+            "facebook.com", "youtube.com", "vimeo.com", "reddit.com",
+            "twitter.com", "x.com", "instagram.com"
+        ))
+    )
 
 
 def is_rate_limit_error(exc):
@@ -1173,8 +1199,9 @@ async def handle_message(update, context):
         await handle_telegram_file(update, context, file_obj)
         return
     text = (update.message.text or "").strip()
-    if text.startswith(("http://", "https://")):
-        await handle_link(update, context, text)
+    url = extract_first_url(text)
+    if url:
+        await handle_link(update, context, url)
         return
     await update.message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
 
@@ -1207,7 +1234,15 @@ async def handle_link(update, context, url):
     info = await fetch_url_info_safe(url)
     if not info.get("is_video"):
         if info.get("rate_limited") and info.get("youtube"):
-            await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
+            await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\\n\\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
+            return
+        if info.get("error") and is_video_platform_url(url):
+            # Metadata extraction can fail temporarily while the platform's direct
+            # media extractor still works. Never send a failed social-video URL
+            # to the generic requests downloader as if it were a file URL.
+            await msg.edit_text("⚠️ تعذّر جلب تفاصيل المنشور؛ سأحاول تنزيل الفيديو مباشرةً بالجودة المناسبة...")
+            fallback_info = {"is_video": True, "title": "Video", "formats": []}
+            await do_download(update, context, msg, url, "720", fallback_info)
             return
         await msg.edit_text("📥 رابط مباشر — جارٍ التحميل...")
         await do_download(update, context, msg, url, None, None)
