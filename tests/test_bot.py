@@ -181,6 +181,30 @@ class TransferTests(unittest.TestCase):
         self.assertIn("abc123", text)
         self.assertIn("50.0%", text)
         self.assertIn("السرعة", text)
+        self.assertIn("الوقت المنقضي", text)
+
+    def test_progress_dashboard_renders_active_tasks_and_refresh_interval(self):
+        task = {
+            "id": "live123", "user_id": 123456, "name": "large-file.bin",
+            "status": "تنزيل", "started_at": __import__("time").time(),
+            "download_bytes": 25, "download_total": 100, "download_speed": 5,
+        }
+        with patch.dict(bot.active_tasks, {"live123": task}, clear=True), patch.dict(
+            bot.queued_tasks, {}, clear=True
+        ):
+            dashboard, keyboard = bot.render_progress_dashboard()
+        self.assertIn("تحديث تلقائي", dashboard)
+        self.assertIn("نشطة: 1", dashboard)
+        self.assertIn("live123", dashboard)
+        self.assertIsNotNone(keyboard)
+
+    def test_progress_dashboard_handles_empty_queue(self):
+        with patch.dict(bot.active_tasks, {}, clear=True), patch.dict(
+            bot.queued_tasks, {}, clear=True
+        ):
+            dashboard, keyboard = bot.render_progress_dashboard()
+        self.assertIn("لا توجد مهام نشطة", dashboard)
+        self.assertIsNone(keyboard)
 
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:

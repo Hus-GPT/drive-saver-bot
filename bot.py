@@ -38,6 +38,7 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 PROGRESS_UPDATE_INTERVAL = 1
+PROGRESS_DASHBOARD_REFRESH_SECONDS = max(3, int(os.environ.get("PROGRESS_DASHBOARD_REFRESH_SECONDS", "5")))
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
 MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -57,6 +58,7 @@ queued_tasks = {}
 active_tasks = {}
 transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '8'))))
 cancel_flags = {}
+progress_dashboard_loops = set()
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
 
@@ -561,13 +563,16 @@ def format_task_progress(task):
     else:
         bar = "░" * 20
         amount = human_size(done) if done else "جارٍ تحديد الحجم"
+    started_at = float(task.get("started_at") or time.time())
+    elapsed = human_time(max(0, time.time() - started_at))
     return (
         f"🆔 المهمة: {task_id}\n"
         f"📄 الملف: {str(name)[:100]}\n"
         f"⚙️ المرحلة: {phase} — {status}\n"
         f"[{bar}]\n"
         f"💾 {amount}\n"
-        f"⚡ السرعة: {human_size(speed)}/ث"
+        f"⚡ السرعة: {human_size(speed)}/ث\\n"
+        f"⏱️ الوقت المنقضي: {elapsed}"
     )
 
 
@@ -582,23 +587,62 @@ def build_progress_keyboard(tasks):
     return InlineKeyboardMarkup(rows)
 
 
+def render_progress_dashboard():
+    tasks = list(active_tasks.values()) + list(queued_tasks.values())
+    tasks.sort(key=lambda task: task.get("started_at", 0))
+    if not tasks:
+        return "📊 لا توجد مهام نشطة الآن. أرسل رابطًا أو ملفًا لبدء مهمة جديدة.", None
+    lines = [
+        "📊 لوحة تقدم المهام — تحديث تلقائي",
+        f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}",
+        f"🔃 التحديث كل {PROGRESS_DASHBOARD_REFRESH_SECONDS} ثوانٍ",
+        "",
+    ]
+    lines.extend(format_task_progress(task) for task in tasks[:8])
+    if len(tasks) > 8:
+        lines.append(f"… وهناك {len(tasks) - 8} مهام أخرى؛ استخدم /queue للقائمة الكاملة.")
+    return "\n\n".join(lines), build_progress_keyboard(tasks)
+
+
+async def progress_dashboard_loop(application, chat_id, message_id):
+    """Keep one Telegram dashboard message updated while transfers are active."""
+    try:
+        while True:
+            await asyncio.sleep(PROGRESS_DASHBOARD_REFRESH_SECONDS)
+            text, keyboard = render_progress_dashboard()
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    logger.debug("Progress dashboard update skipped: %s", exc)
+            if keyboard is None:
+                return
+    finally:
+        progress_dashboard_loops.discard(chat_id)
+
+
 async def cmd_progress(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    tasks = list(active_tasks.values()) + list(queued_tasks.values())
-    if not tasks:
-        await update.message.reply_text("لا توجد مهام نشطة الآن. أرسل رابطًا أو ملفًا لبدء مهمة جديدة.")
-        return
-    tasks.sort(key=lambda task: task.get("started_at", 0))
-    lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
-    lines.extend(format_task_progress(task) for task in tasks[:8])
-    await update.message.reply_text(
-        "\n\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=build_progress_keyboard(tasks),
+    text, keyboard = render_progress_dashboard()
+    message = await update.message.reply_text(
+        text,
+        reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-
+    chat_id = update.effective_chat.id
+    if keyboard is not None and chat_id not in progress_dashboard_loops:
+        progress_dashboard_loops.add(chat_id)
+        context.application.create_task(
+            progress_dashboard_loop(context.application, chat_id, message.message_id),
+            name=f"progress-dashboard-{chat_id}",
+        )
 
 async def cmd_status(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -706,16 +750,10 @@ async def handle_callback(update, context):
     data = q.data
     uid = update.effective_user.id
     if data == "progress_refresh":
-        tasks = list(active_tasks.values()) + list(queued_tasks.values())
-        tasks.sort(key=lambda task: task.get("started_at", 0))
-        if not tasks:
-            await q.edit_message_text("📊 لا توجد مهام نشطة الآن.")
-            return
-        lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
-        lines.extend(format_task_progress(task) for task in tasks[:8])
+        text, keyboard = render_progress_dashboard()
         await q.edit_message_text(
-            "\n\n".join(lines),
-            reply_markup=build_progress_keyboard(tasks),
+            text,
+            reply_markup=keyboard,
             disable_web_page_preview=True,
         )
         return
@@ -725,11 +763,11 @@ async def handle_callback(update, context):
         if not task:
             await q.edit_message_text("انتهت هذه المهمة أو لم تعد نشطة. أرسل /progress لعرض المهام الحالية.")
             return
-        await q.edit_message_text(
+        await q.message.reply_text(
             format_task_progress(task),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 تحديث", callback_data=f"progress|{task_id}"),
-                InlineKeyboardButton("📋 كل المهام", callback_data="progress_refresh"),
+                InlineKeyboardButton("📋 لوحة المهام", callback_data="progress_refresh"),
             ]]),
             disable_web_page_preview=True,
         )
