@@ -576,5 +576,52 @@ class TransferTests(unittest.TestCase):
         self.assertFalse(bot.is_likely_direct_file_url("https://example.com/watch?id=archive.zip"))
 
 
+
+class UnifiedIntakeTests(unittest.TestCase):
+    def test_extract_urls_returns_all_unique_urls_in_order(self):
+        text = "First https://example.com/a, then https://drive.google.com/file/d/abc/view and https://example.com/a!"
+        self.assertEqual(
+            bot.extract_urls(text),
+            ["https://example.com/a", "https://drive.google.com/file/d/abc/view"],
+        )
+
+    def test_extract_urls_uses_caption_text_too_at_handler_level(self):
+        self.assertEqual(
+            bot.extract_urls("Caption: https://example.com/file.pdf"),
+            ["https://example.com/file.pdf"],
+        )
+
+    def test_google_drive_file_id_variants(self):
+        cases = {
+            "https://drive.google.com/file/d/FILE_123/view?usp=sharing": "FILE_123",
+            "https://drive.google.com/drive/folders/FOLDER-123?usp=sharing": "FOLDER-123",
+            "https://docs.google.com/spreadsheets/d/SHEET_123/edit": "SHEET_123",
+            "https://drive.google.com/open?id=QUERY_123": "QUERY_123",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(bot.google_drive_file_id(url), expected)
+
+    def test_google_drive_host_detection(self):
+        self.assertTrue(bot.is_google_drive_url("https://drive.google.com/file/d/abc/view"))
+        self.assertTrue(bot.is_google_drive_url("https://docs.google.com/document/d/abc/edit"))
+        self.assertFalse(bot.is_google_drive_url("https://example.com/drive.google.com/file"))
+
+    def test_ytdlp_cookie_file_is_optional_and_not_added_if_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cookie_path = os.path.join(tmp, "cookies.txt")
+            with patch.dict(os.environ, {"YTDLP_COOKIES_FILE": cookie_path}):
+                self.assertNotIn("cookiefile", bot.ytdlp_opts())
+                with open(cookie_path, "w", encoding="utf-8") as handle:
+                    handle.write("# Netscape HTTP Cookie File\\n")
+                self.assertEqual(bot.ytdlp_opts()["cookiefile"], cookie_path)
+
+    def test_youtube_bot_challenge_is_recognized(self):
+        self.assertTrue(bot.is_youtube_bot_challenge(
+            "Sign in to confirm you're not a bot. Use --cookies-from-browser"
+        ))
+        self.assertFalse(bot.is_youtube_bot_challenge("HTTP Error 404"))
+
+
 if __name__ == "__main__":
     unittest.main()
