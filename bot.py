@@ -37,11 +37,11 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
-PROGRESS_UPDATE_INTERVAL = 2
+PROGRESS_UPDATE_INTERVAL = 1
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
 MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
-DRIVE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MiB, multiple of 256 KiB
+DRIVE_UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024  # 32 MiB, multiple of 256 KiB
 TASK_LOG_PATH = os.environ.get('TASK_LOG_PATH', '/content/drive/MyDrive/.drive_saver_bot/tasks.jsonl')
 TASK_LOG_LOCK = threading.Lock()
 
@@ -55,7 +55,7 @@ authenticated_users = set()
 pending_downloads = {}
 queued_tasks = {}
 active_tasks = {}
-transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '2'))))
+transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '8'))))
 cancel_flags = {}
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
@@ -385,7 +385,7 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         "progress_hooks": [hook],
         "postprocessors": pps,
         "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "4")),
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "8")),
         "retries": 5,
         "fragment_retries": 5,
         "socket_timeout": 30,
@@ -433,7 +433,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
                 done = existing
                 mode = "ab" if resume else "wb"
                 with open(fp, mode) as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
                         if cancel_check and cancel_check():
                             raise RuntimeError("__CANCELLED__")
                         if chunk:
@@ -531,6 +531,72 @@ async def cmd_queue(update, context):
     for item in waiting[:10]:
         lines.append(f"• بانتظار اختيار الجودة — {item.get('url', 'رابط')[:70]}")
     await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+
+def format_task_progress(task):
+    """Render one task's latest in-memory transfer progress."""
+    task_id = task.get("id") or task.get("task_id") or "?"
+    status = task.get("status", "قيد التنفيذ")
+    name = task.get("name") or task.get("url") or task.get("file_name") or "ملف"
+    phase = "تنزيل"
+    done = total = speed = 0
+    if "upload_bytes" in task or status == "رفع إلى Drive":
+        phase = "رفع إلى Drive"
+        done = int(task.get("upload_bytes") or 0)
+        total = int(task.get("upload_total") or 0)
+        speed = float(task.get("upload_speed") or 0)
+    elif "download_bytes" in task:
+        done = int(task.get("download_bytes") or 0)
+        total = int(task.get("download_total") or 0)
+        speed = float(task.get("download_speed") or 0)
+    elif "telegram_download_started" in status.lower():
+        phase = "تنزيل من Telegram"
+    if total > 0:
+        pct = max(0.0, min(100.0, done / total * 100))
+        filled = int(pct // 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        amount = f"{human_size(done)} / {human_size(total)} ({pct:.1f}%)"
+    else:
+        bar = "░" * 20
+        amount = human_size(done) if done else "جارٍ تحديد الحجم"
+    return (
+        f"🆔 المهمة: {task_id}\\n"
+        f"📄 الملف: {str(name)[:100]}\\n"
+        f"⚙️ المرحلة: {phase} — {status}\\n"
+        f"[{bar}]\\n"
+        f"💾 {amount}\\n"
+        f"⚡ السرعة: {human_size(speed)}/ث"
+    )
+
+
+def build_progress_keyboard(tasks):
+    rows = []
+    for task in tasks[:12]:
+        task_id = task.get("id") or task.get("task_id")
+        if task_id:
+            name = str(task.get("name") or task.get("file_name") or task.get("url") or "ملف")
+            rows.append([InlineKeyboardButton(f"📊 {task_id} · {name[:32]}", callback_data=f"progress|{task_id}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث التقدم", callback_data="progress_refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_progress(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    tasks = list(active_tasks.values()) + list(queued_tasks.values())
+    if not tasks:
+        await update.message.reply_text("لا توجد مهام نشطة الآن. أرسل رابطًا أو ملفًا لبدء مهمة جديدة.")
+        return
+    tasks.sort(key=lambda task: task.get("started_at", 0))
+    lines = ["📊 *لوحة تقدم المهام*\\n", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
+    lines.extend(format_task_progress(task) for task in tasks[:8])
+    await update.message.reply_text(
+        "\\n\\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=build_progress_keyboard(tasks),
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_status(update, context):
@@ -638,6 +704,35 @@ async def handle_callback(update, context):
     await q.answer()
     data = q.data
     uid = update.effective_user.id
+    if data == "progress_refresh":
+        tasks = list(active_tasks.values()) + list(queued_tasks.values())
+        tasks.sort(key=lambda task: task.get("started_at", 0))
+        if not tasks:
+            await q.edit_message_text("📊 لا توجد مهام نشطة الآن.")
+            return
+        lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
+        lines.extend(format_task_progress(task) for task in tasks[:8])
+        await q.edit_message_text(
+            "\\n\\n".join(lines),
+            reply_markup=build_progress_keyboard(tasks),
+            disable_web_page_preview=True,
+        )
+        return
+    if data.startswith("progress|"):
+        task_id = data.split("|", 1)[1]
+        task = active_tasks.get(task_id) or queued_tasks.get(task_id)
+        if not task:
+            await q.edit_message_text("انتهت هذه المهمة أو لم تعد نشطة. أرسل /progress لعرض المهام الحالية.")
+            return
+        await q.edit_message_text(
+            format_task_progress(task),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 تحديث", callback_data=f"progress|{task_id}"),
+                InlineKeyboardButton("📋 كل المهام", callback_data="progress_refresh"),
+            ]]),
+            disable_web_page_preview=True,
+        )
+        return
     if data.startswith("cancel|"):
         sid = data.split("|", 1)[1]
         p = pending_downloads.pop(sid, None)
@@ -1009,7 +1104,7 @@ async def configure_bot_menu(application):
     commands = [
         BotCommand("start", "بدء استخدام البوت"),
         BotCommand("help", "المساعدة"),
-        BotCommand("queue", "العمليات الجارية والمنتظرة"),
+        BotCommand("queue", "العمليات الجارية والمنتظرة"),\n        BotCommand("progress", "لوحة تقدم المهام"),
         BotCommand("status", "حالة البوت ومساحة Colab"),
         BotCommand("colab", "فتح دفتر Google Colab"),
         BotCommand("cancel", "إلغاء مهمة"),
@@ -1068,7 +1163,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("queue", cmd_queue))\n    app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
