@@ -576,5 +576,166 @@ class TransferTests(unittest.TestCase):
         self.assertFalse(bot.is_likely_direct_file_url("https://example.com/watch?id=archive.zip"))
 
 
+
+class UnifiedIntakeTests(unittest.TestCase):
+    def test_extract_urls_returns_all_unique_urls_in_order(self):
+        text = "First https://example.com/a, then https://drive.google.com/file/d/abc/view and https://example.com/a!"
+        self.assertEqual(
+            bot.extract_urls(text),
+            ["https://example.com/a", "https://drive.google.com/file/d/abc/view"],
+        )
+
+    def test_extract_urls_uses_caption_text_too_at_handler_level(self):
+        self.assertEqual(
+            bot.extract_urls("Caption: https://example.com/file.pdf"),
+            ["https://example.com/file.pdf"],
+        )
+
+    def test_google_drive_file_id_variants(self):
+        cases = {
+            "https://drive.google.com/file/d/FILE_123/view?usp=sharing": "FILE_123",
+            "https://drive.google.com/drive/folders/FOLDER-123?usp=sharing": "FOLDER-123",
+            "https://docs.google.com/spreadsheets/d/SHEET_123/edit": "SHEET_123",
+            "https://drive.google.com/open?id=QUERY_123": "QUERY_123",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(bot.google_drive_file_id(url), expected)
+
+    def test_google_drive_host_detection(self):
+        self.assertTrue(bot.is_google_drive_url("https://drive.google.com/file/d/abc/view"))
+        self.assertTrue(bot.is_google_drive_url("https://docs.google.com/document/d/abc/edit"))
+        self.assertFalse(bot.is_google_drive_url("https://example.com/drive.google.com/file"))
+
+    def test_ytdlp_cookie_file_is_optional_and_not_added_if_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cookie_path = os.path.join(tmp, "cookies.txt")
+            with patch.dict(os.environ, {"YTDLP_COOKIES_FILE": cookie_path}):
+                self.assertNotIn("cookiefile", bot.ytdlp_opts())
+                with open(cookie_path, "w", encoding="utf-8") as handle:
+                    handle.write("# Netscape HTTP Cookie File\\n")
+                self.assertEqual(bot.ytdlp_opts()["cookiefile"], cookie_path)
+
+    def test_quality_keyboard_offers_best_available_and_8k_when_present(self):
+        formats = [
+            {"height": 4320, "vcodec": "av01", "acodec": "none"},
+            {"height": 1080, "vcodec": "avc1", "acodec": "none"},
+            {"height": 720, "vcodec": "none", "acodec": "mp4a"},
+        ]
+        class FakeButton:
+            def __init__(self, text, callback_data):
+                self.text, self.callback_data = text, callback_data
+        class FakeMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+        with patch.object(bot, "InlineKeyboardButton", FakeButton), patch.object(
+            bot, "InlineKeyboardMarkup", FakeMarkup
+        ):
+            markup = bot.build_quality_keyboard("abc123", formats)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("dl|abc123|best", callbacks)
+        self.assertIn("dl|abc123|4320", callbacks)
+        self.assertIn("dl|abc123|1080", callbacks)
+        self.assertIn("dl|abc123|720", callbacks)
+
+    def test_best_quality_download_does_not_apply_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "best")
+        self.assertEqual(captured["format"], "bestvideo+bestaudio/best")
+
+    def test_numeric_quality_download_keeps_requested_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "720")
+        self.assertEqual(captured["format"], "bestvideo[height<=720]+bestaudio/best[height<=720]/best")
+
+    def test_youtube_playlist_url_detection(self):
+        self.assertTrue(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/playlist?list=PL_example"
+        ))
+        self.assertTrue(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/watch?v=abc123&list=PL_example"
+        ))
+        self.assertFalse(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/watch?v=abc123"
+        ))
+        self.assertFalse(bot.is_youtube_playlist_url(
+            "https://example.com/playlist?list=PL_example"
+        ))
+
+    def test_missing_format_metadata_still_offers_explicit_quality_choices(self):
+        class FakeButton:
+            def __init__(self, text, callback_data):
+                self.text, self.callback_data = text, callback_data
+        class FakeMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+        with patch.object(bot, "InlineKeyboardButton", FakeButton), patch.object(
+            bot, "InlineKeyboardMarkup", FakeMarkup
+        ):
+            markup = bot.build_quality_keyboard("fallback1", [])
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("dl|fallback1|best", callbacks)
+        self.assertIn("dl|fallback1|720", callbacks)
+        self.assertIn("dl|fallback1|1080", callbacks)
+        self.assertIn("dl|fallback1|mp3", callbacks)
+
+    def test_playlist_download_enables_playlist_mode_and_preserves_chosen_quality(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                for name in ("001 - First.mp4", "002 - Second.mp4"):
+                    with open(os.path.join(captured["outtmpl"].rsplit("/", 1)[0], name), "wb") as handle:
+                        handle.write(b"video")
+                return {"_type": "playlist", "entries": [{}, {}]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            paths = bot.download_youtube_playlist(
+                "https://www.youtube.com/playlist?list=PL_example", tmp, "720"
+            )
+        self.assertEqual(len(paths), 2)
+        self.assertFalse(captured["noplaylist"])
+        self.assertIn("%(playlist_index)03d", captured["outtmpl"])
+        self.assertEqual(
+            captured["format"],
+            "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        )
+        self.assertTrue(captured["ignoreerrors"])
+
+    def test_youtube_bot_challenge_is_recognized(self):
+        self.assertTrue(bot.is_youtube_bot_challenge(
+            "Sign in to confirm you're not a bot. Use --cookies-from-browser"
+        ))
+        self.assertFalse(bot.is_youtube_bot_challenge("HTTP Error 404"))
+
+
 if __name__ == "__main__":
     unittest.main()
