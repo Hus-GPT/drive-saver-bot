@@ -489,7 +489,7 @@ async def cmd_start(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "👋 أهلاً بك في *DriveSaverBot*!\\n\\n"
+        "👋 أهلاً بك في *DriveSaverBot*!\n\n"
         "تم تقييد البوت على حساب المالك المصرّح به. أرسل رابطًا أو ملفًا للبدء، أو استخدم /help.",
         parse_mode="Markdown",
     )
@@ -871,13 +871,13 @@ async def do_download(update, context, msg, url, quality, info):
                         "status": "archive_member_completed",
                         "already_exists": result.get("already_exists", False),
                     })
-                links = "\\n".join(
+                links = "\n".join(
                     f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
                     for item in results
                 )
                 persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
                 await msg.edit_text(
-                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\\n\\n{links}",
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
                     disable_web_page_preview=True,
                 )
                 return
@@ -1020,13 +1020,13 @@ async def handle_telegram_file(update, context, file_obj):
                         "drive_link": result["link"], "status": "archive_member_completed",
                         "already_exists": result.get("already_exists", False),
                     })
-                links = "\\n".join(
+                links = "\n".join(
                     f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
                     for item in results
                 )
                 persist_task({"task_id": task_id, "user_id": uid, "status": "completed", "archive": True, "extracted_count": len(results)})
                 await msg.edit_text(
-                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\\n\\n{links}",
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
                     disable_web_page_preview=True,
                 )
                 return
@@ -1165,7 +1165,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("queue", cmd_queue))\n    app.add_handler(CommandHandler("progress", cmd_progress))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
