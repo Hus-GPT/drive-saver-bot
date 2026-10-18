@@ -111,27 +111,81 @@ def sha256_file(file_path):
     return digest.hexdigest()
 
 
+def md5_file(file_path):
+    """Return the MD5 checksum used by Drive for binary-file metadata comparisons."""
+    digest = hashlib.md5()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iter_drive_files_under_root(service):
+    """Yield every non-trashed file under DRIVE_FOLDER_ID, including nested folders."""
+    queue = [DRIVE_FOLDER_ID]
+    visited_folders = set()
+    while queue:
+        folder_id = queue.pop()
+        if folder_id in visited_folders:
+            continue
+        visited_folders.add(folder_id)
+        page_token = None
+        while True:
+            kwargs = {
+                "q": f"'{folder_id}' in parents and trashed = false",
+                "pageSize": 1000,
+                "fields": "nextPageToken,files(id,name,mimeType,parents,size,md5Checksum,webViewLink,appProperties)",
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            response = service.files().list(**kwargs).execute(num_retries=3)
+            for item in response.get("files", []):
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    queue.append(item["id"])
+                elif item.get("mimeType") != "application/vnd.google-apps.shortcut":
+                    yield item
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+
 def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
-    """Avoid duplicate uploads, use resumable chunks, and verify the saved file."""
+    """Deduplicate identical content across the entire Drive folder tree, then verify upload."""
     expected_size = os.path.getsize(file_path)
     fingerprint = sha256_file(file_path)
+    local_md5 = md5_file(file_path)
     service = drive_service or get_drive_service()
-    query = (
-        f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and "
-        f"appProperties has {{ key='sha256' and value='{fingerprint}' }}"
-    )
-    existing = service.files().list(
-        q=query, pageSize=1, fields="files(id, name, size, webViewLink, appProperties)"
-    ).execute(num_retries=3).get("files", [])
-    for item in existing:
-        if int(item.get("size", -1)) == expected_size:
-            if progress_cb:
-                progress_cb(expected_size, expected_size)
-            return {
-                "id": item["id"], "link": item.get("webViewLink"),
-                "name": item.get("name") or Path(file_path).name,
-                "size": expected_size, "already_exists": True,
-            }
+
+    # appProperties covers files uploaded by this bot. md5Checksum also covers older
+    # binary files in Drive that predate SHA-256 metadata. Never treat size alone as proof.
+    for item in iter_drive_files_under_root(service):
+        if int(item.get("size", -1)) != expected_size:
+            continue
+        properties = item.get("appProperties") or {}
+        same_content = properties.get("sha256") == fingerprint
+        if not same_content and item.get("md5Checksum"):
+            same_content = item["md5Checksum"].lower() == local_md5.lower()
+        if not same_content:
+            continue
+
+        # Backfill the SHA-256 property on matching legacy files so later checks are fast
+        # and consistent. A metadata-update failure must not cause a duplicate upload.
+        if properties.get("sha256") != fingerprint:
+            try:
+                service.files().update(
+                    fileId=item["id"],
+                    body={"appProperties": {**properties, "sha256": fingerprint}},
+                    fields="id,appProperties",
+                ).execute(num_retries=3)
+            except Exception:
+                logger.warning("Could not backfill SHA-256 metadata for existing Drive file %s", item.get("id"))
+        if progress_cb:
+            progress_cb(expected_size, expected_size)
+        return {
+            "id": item["id"], "link": item.get("webViewLink"),
+            "name": item.get("name") or Path(file_path).name,
+            "size": expected_size, "already_exists": True,
+        }
 
     metadata = {
         "name": Path(file_path).name,
