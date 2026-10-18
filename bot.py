@@ -1105,7 +1105,8 @@ async def configure_bot_menu(application):
     commands = [
         BotCommand("start", "بدء استخدام البوت"),
         BotCommand("help", "المساعدة"),
-        BotCommand("queue", "العمليات الجارية والمنتظرة"),\n        BotCommand("progress", "لوحة تقدم المهام"),
+        BotCommand("queue", "العمليات الجارية والمنتظرة"),
+        BotCommand("progress", "لوحة تقدم المهام"),
         BotCommand("status", "حالة البوت ومساحة Colab"),
         BotCommand("colab", "فتح دفتر Google Colab"),
         BotCommand("cancel", "إلغاء مهمة"),
