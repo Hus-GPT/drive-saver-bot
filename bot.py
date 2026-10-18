@@ -677,7 +677,7 @@ def _http_retry_delay(exc, attempt):
             return min(120, max(1, int(float(retry_after))))
         except (TypeError, ValueError):
             pass
-    return min(60, 3 * (2 ** attempt))
+    return min(90, 5 * (2 ** attempt))
 
 
 def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
@@ -689,7 +689,8 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
         if parallel_path:
             return parallel_path
     base_headers = {"User-Agent": "Mozilla/5.0"}
-    attempts = 3
+    # Internet Archive storage nodes can return transient 503 responses; allow a longer recovery window.
+    attempts = 6
 
     for attempt in range(attempts):
         if cancel_check and cancel_check():
@@ -738,6 +739,8 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
             if status is not None and status not in (408, 425, 429) and status < 500:
                 raise
             delay = _http_retry_delay(exc, attempt)
+            if "archive.org" in urlparse(url).netloc.lower() and status == 503:
+                logger.warning("Internet Archive returned HTTP 503; waiting %ss before retry %s/%s.", delay, attempt + 2, attempts)
             logger.warning(
                 "Direct download attempt %s/%s failed%s; retrying in %ss: %s",
                 attempt + 1, attempts,
