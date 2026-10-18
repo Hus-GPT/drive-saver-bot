@@ -37,13 +37,23 @@ class FakeRequest:
 
 
 class FakeFiles:
-    def __init__(self, size, existing=None):
+    def __init__(self, size, existing=None, by_parent=None):
         self.size = size
         self.existing = existing or []
+        self.by_parent = by_parent or {}
         self.request = None
 
-    def list(self, q, pageSize, fields):
-        return FakeListRequest(self.existing)
+    def list(self, q, pageSize, fields, pageToken=None):
+        import re
+        match = re.search(r"'([^']+)' in parents", q)
+        parent_id = match.group(1) if match else ""
+        files = self.by_parent.get(parent_id)
+        if files is None:
+            files = self.existing if parent_id == "folder-test" else []
+        return FakeListRequest(files)
+
+    def update(self, fileId, body, fields):
+        return FakeUpdateRequest()
 
     def create(self, body, media_body, fields):
         fingerprint = body.get("appProperties", {}).get("sha256", "abc")
@@ -60,6 +70,11 @@ class FakeListRequest:
 
     def execute(self, num_retries=0):
         return {"files": self.files}
+
+
+class FakeUpdateRequest:
+    def execute(self, num_retries=0):
+        return {"id": "existing-id"}
 
 
 class FakeGetRequest:
@@ -79,8 +94,8 @@ class FakeGetRequest:
 
 
 class FakeService:
-    def __init__(self, size, existing=None):
-        self.fake_files = FakeFiles(size, existing)
+    def __init__(self, size, existing=None, by_parent=None):
+        self.fake_files = FakeFiles(size, existing, by_parent)
 
     def files(self):
         return self.fake_files
@@ -112,6 +127,7 @@ class TransferTests(unittest.TestCase):
                 "name": "sample.bin",
                 "size": "10",
                 "webViewLink": "https://drive.google.com/file/d/existing-id",
+                "appProperties": {"sha256": "abc"},
             }]
             service = FakeService(10, existing)
             with patch.object(bot, "drive_service", service), patch.object(
@@ -121,6 +137,53 @@ class TransferTests(unittest.TestCase):
             self.assertTrue(result["already_exists"])
             self.assertEqual(result["id"], "existing-id")
             media_factory.assert_not_called()
+
+
+    def test_duplicate_in_nested_folder_is_not_uploaded(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"0123456789")
+            handle.flush()
+            nested_file = {
+                "id": "nested-existing-id",
+                "name": "renamed.bin",
+                "size": "10",
+                "webViewLink": "https://drive.google.com/file/d/nested-existing-id",
+                "appProperties": {"sha256": "abc"},
+            }
+            by_parent = {
+                "folder-test": [{
+                    "id": "nested-folder-id",
+                    "name": "Nested",
+                    "mimeType": "application/vnd.google-apps.folder",
+                }],
+                "nested-folder-id": [nested_file],
+            }
+            service = FakeService(10, by_parent=by_parent)
+            with patch.object(bot, "drive_service", service), patch.object(
+                bot, "sha256_file", return_value="abc"
+            ), patch.object(bot, "MediaFileUpload", return_value=object()) as media_factory:
+                result = bot.upload_to_drive(handle.name)
+            self.assertTrue(result["already_exists"])
+            self.assertEqual(result["id"], "nested-existing-id")
+            media_factory.assert_not_called()
+
+    def test_same_size_without_matching_fingerprint_is_not_assumed_duplicate(self):
+        with tempfile.NamedTemporaryFile() as handle:
+            handle.write(b"0123456789")
+            handle.flush()
+            existing = [{
+                "id": "unrelated-id",
+                "name": "different.bin",
+                "size": "10",
+                "webViewLink": "https://drive.google.com/file/d/unrelated-id",
+            }]
+            service = FakeService(10, existing)
+            with patch.object(bot, "drive_service", service), patch.object(
+                bot, "sha256_file", return_value="abc"
+            ), patch.object(bot, "MediaFileUpload", return_value=object()):
+                result = bot.upload_to_drive(handle.name)
+            self.assertFalse(result["already_exists"])
+            self.assertEqual(result["id"], "drive-id-1")
 
     def test_upload_fails_if_drive_size_does_not_match(self):
         with tempfile.NamedTemporaryFile() as handle:
