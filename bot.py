@@ -508,6 +508,7 @@ async def cmd_help(update, context):
         "📈 /progress — لوحة تقدم قابلة للتحديث لكل مهمة\n"
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
+        "🔁 /retry [رقم المهمة] — إعادة محاولة مهمة فاشلة\\n"
         "📒 /colab — فتح دفتر Google Colab\n"
         "🆔 /id — معرف Telegram",
         parse_mode="Markdown",
