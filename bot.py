@@ -654,19 +654,21 @@ def fetch_url_info(url):
 
 
 def build_quality_keyboard(short_id, formats):
+    # Offer every supported ceiling up to the best video stream found, including 8K.
+    levels = [4320, 2880, 2160, 1440, 1080, 720, 480, 360, 144]
     available = set()
     for f in formats:
         if f.get("vcodec") == "none":
             continue
         h = f.get("height")
         if h:
-            for x in [2160, 1440, 1080, 720, 480, 360, 144]:
-                if h >= x:
-                    available.add(str(x))
-                    break
-    order = ["144", "360", "480", "720", "1080", "1440", "2160"]
-    labels = {"144": "144p", "360": "360p", "480": "480p", "720": "720p", "1080": "1080p", "1440": "2K", "2160": "4K"}
-    buttons = []
+            available.update(str(level) for level in levels if h >= level)
+    order = ["144", "360", "480", "720", "1080", "1440", "2160", "2880", "4320"]
+    labels = {
+        "144": "144p", "360": "360p", "480": "480p", "720": "720p",
+        "1080": "1080p", "1440": "2K", "2160": "4K", "2880": "5K", "4320": "8K",
+    }
+    buttons = [[InlineKeyboardButton("🏆 أعلى جودة متاحة", callback_data=f"dl|{short_id}|best")]]
     row = []
     for q in order:
         if q in available:
@@ -687,7 +689,12 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         pps = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
         ext = "mp3"
     else:
-        fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        # "best" deliberately has no height cap: yt-dlp selects the best available
+        # video+audio streams and merges them. Numeric choices remain capped.
+        if str(quality).lower() in {"best", "best_available", "max"}:
+            fmt = "bestvideo*+bestaudio/best"
+        else:
+            fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         pps = []
         ext = None
 
@@ -1392,9 +1399,9 @@ async def handle_link(update, context, url):
             # Metadata extraction can fail temporarily while the platform's direct
             # media extractor still works. Never send a failed social-video URL
             # to the generic requests downloader as if it were a file URL.
-            await msg.edit_text("⚠️ تعذّر جلب تفاصيل المنشور؛ سأحاول تنزيل الفيديو مباشرةً بالجودة المناسبة...")
+            await msg.edit_text("⚠️ تعذّر جلب تفاصيل المنشور؛ سأحاول تنزيل أعلى جودة متاحة مباشرةً. قد تفشل المحاولة إذا كانت المنصة تتطلب تسجيل الدخول أو تمنع الطلب.")
             fallback_info = {"is_video": True, "title": "Video", "formats": []}
-            await do_download(update, context, msg, url, "720", fallback_info)
+            await do_download(update, context, msg, url, "best", fallback_info)
             return
         await msg.edit_text("📥 رابط مباشر — جارٍ التحميل...")
         await do_download(update, context, msg, url, None, None)
