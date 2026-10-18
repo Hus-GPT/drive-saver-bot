@@ -10,6 +10,7 @@ import json
 import hashlib
 import re
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import posixpath
 from types import SimpleNamespace
 from pathlib import Path
@@ -403,10 +404,138 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         return path
 
 
+def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel_check=None):
+    """Download independent byte ranges concurrently when the server proves Range support."""
+    workers = max(1, int(os.environ.get("DIRECT_DOWNLOAD_WORKERS", "4")))
+    minimum_size = max(1, int(os.environ.get("DIRECT_DOWNLOAD_MIN_PARALLEL_BYTES", str(32 * 1024 * 1024))))
+    chunk_size = max(1, int(os.environ.get("DIRECT_DOWNLOAD_CHUNK_BYTES", str(32 * 1024 * 1024))))
+    if workers < 2 or os.path.exists(output_path):
+        return None
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "identity"}
+    try:
+        with requests.get(
+            url, stream=True, timeout=(15, 30),
+            headers={**headers, "Range": "bytes=0-0"},
+        ) as probe:
+            if probe.status_code != 206:
+                return None
+            match = re.fullmatch(r"bytes\\s+0-0/(\\d+)", probe.headers.get("Content-Range", "").strip(), re.I)
+            if not match:
+                return None
+            total = int(match.group(1))
+            if total < minimum_size:
+                return None
+    except Exception as exc:
+        logger.debug("Parallel range probe unavailable; using sequential download: %s", exc)
+        return None
+
+    ranges = [
+        (start, min(total - 1, start + chunk_size - 1))
+        for start in range(0, total, chunk_size)
+    ]
+    if len(ranges) < 2:
+        return None
+
+    parts_dir = tempfile.mkdtemp(prefix=".drive-saver-parts-", dir=out_dir)
+    temporary_output = output_path + ".parallel.tmp"
+    progress_lock = threading.Lock()
+    downloaded = 0
+
+    def fetch_range(index, start, end):
+        nonlocal downloaded
+        expected = end - start + 1
+        part_path = os.path.join(parts_dir, f"{index:06d}.part")
+        range_headers = {**headers, "Range": f"bytes={start}-{end}"}
+        for attempt in range(3):
+            if cancel_check and cancel_check():
+                raise RuntimeError("__CANCELLED__")
+            try:
+                received = 0
+                with requests.get(
+                    url, stream=True, timeout=(15, 120), headers=range_headers
+                ) as response:
+                    if response.status_code != 206:
+                        raise IOError(f"Range request returned HTTP {response.status_code}")
+                    match = re.fullmatch(
+                        r"bytes\\s+(\\d+)-(\\d+)/(\\d+)",
+                        response.headers.get("Content-Range", "").strip(),
+                        re.I,
+                    )
+                    if not match or tuple(map(int, match.groups())) != (start, end, total):
+                        raise IOError("Source returned an invalid Content-Range response")
+                    response.raise_for_status()
+                    with open(part_path, "wb") as handle:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if cancel_check and cancel_check():
+                                raise RuntimeError("__CANCELLED__")
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            received += len(chunk)
+                            with progress_lock:
+                                downloaded += len(chunk)
+                                if progress_cb:
+                                    progress_cb({
+                                        "downloaded_bytes": downloaded,
+                                        "total_bytes": total,
+                                    })
+                if received != expected:
+                    raise IOError(f"Range length mismatch: expected {expected}, got {received}")
+                return part_path
+            except Exception as exc:
+                if "__CANCELLED__" in str(exc) or attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
+        raise IOError("Range download failed after retries")
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
+            futures = [
+                executor.submit(fetch_range, index, start, end)
+                for index, (start, end) in enumerate(ranges)
+            ]
+            part_paths = {}
+            for future in as_completed(futures):
+                part_path = future.result()
+                part_paths[os.path.basename(part_path)] = part_path
+        with open(temporary_output, "wb") as output:
+            for index in range(len(ranges)):
+                part_path = os.path.join(parts_dir, f"{index:06d}.part")
+                with open(part_path, "rb") as part:
+                    shutil.copyfileobj(part, output, length=1024 * 1024)
+        if os.path.getsize(temporary_output) != total:
+            raise IOError("Assembled parallel download has an unexpected size")
+        os.replace(temporary_output, output_path)
+        if progress_cb:
+            progress_cb({"downloaded_bytes": total, "total_bytes": total})
+        logger.info(
+            "Parallel range download completed: %s bytes using %s workers",
+            total, min(workers, len(ranges)),
+        )
+        return output_path
+    except Exception as exc:
+        if "__CANCELLED__" in str(exc) or (cancel_check and cancel_check()):
+            raise RuntimeError("__CANCELLED__") from exc
+        logger.warning("Parallel range download failed; falling back to sequential mode: %s", exc)
+        return None
+    finally:
+        try:
+            if os.path.exists(temporary_output):
+                os.remove(temporary_output)
+        except OSError:
+            pass
+        shutil.rmtree(parts_dir, ignore_errors=True)
+
+
 def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
     filename = urlparse(url).path.rsplit("/", 1)[-1] or "downloaded_file"
     filename = "".join(c for c in filename if c.isalnum() or c in "._- ") or "downloaded_file"
     fp = os.path.join(out_dir, filename)
+    if not os.path.exists(fp):
+        parallel_path = download_direct_parallel(url, out_dir, fp, progress_cb, cancel_check)
+        if parallel_path:
+            return parallel_path
     base_headers = {"User-Agent": "Mozilla/5.0"}
     attempts = 3
 
@@ -421,7 +550,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
             with requests.get(url, stream=True, timeout=(15, 120), headers=headers) as response:
                 if response.status_code == 416 and existing:
                     content_range = response.headers.get("Content-Range", "")
-                    match = __import__("re").search(r"/(\d+)$", content_range)
+                    match = re.search(r"/(\\d+)$", content_range)
                     if match and int(match.group(1)) == existing:
                         return fp
                 response.raise_for_status()
@@ -429,7 +558,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
                 if not resume:
                     existing = 0
                 content_range = response.headers.get("Content-Range", "")
-                match = __import__("re").search(r"/(\d+)$", content_range)
+                match = re.search(r"/(\\d+)$", content_range)
                 content_length = int(response.headers.get("Content-Length", 0) or 0)
                 total = int(match.group(1)) if match else (content_length + existing if content_length else 0)
                 done = existing
@@ -455,7 +584,6 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
             logger.warning("Direct download attempt %s/%s failed; retrying in %ss: %s", attempt + 1, attempts, delay, exc)
             time.sleep(delay)
     raise RuntimeError("Direct download failed after retries.")
-
 
 async def youtube_gate():
     global youtube_last_request
