@@ -54,6 +54,11 @@ queued_tasks = {}
 active_tasks = {}
 transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '2'))))
 cancel_flags = {}
+failed_tasks = {}
+retry_task_specs = {}
+dashboard_message_id = None
+dashboard_chat_id = None
+dashboard_last_update = 0.0
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
 
@@ -196,6 +201,119 @@ def human_time(s):
         return f"{m}:{sec:02d} د"
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{sec:02d} س"
+
+
+
+def progress_bar(done, total, width=12):
+    if not total or total <= 0:
+        return "░" * width
+    filled = max(0, min(width, int((done / total) * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def task_progress_line(task):
+    status = task.get("status", "قيد التنفيذ")
+    if "upload" in status or status == "رفع إلى Drive":
+        done = int(task.get("upload_bytes") or 0)
+        total = int(task.get("upload_total") or task.get("size") or 0)
+        speed = float(task.get("upload_speed") or 0)
+        phase = "رفع"
+    else:
+        done = int(task.get("download_bytes") or 0)
+        total = int(task.get("download_total") or 0)
+        speed = float(task.get("download_speed") or 0)
+        phase = status or "تنزيل"
+    if total:
+        pct = min(100.0, max(0.0, done / total * 100))
+        progress = f"{progress_bar(done, total)} {pct:.0f}% · {human_size(done)}/{human_size(total)}"
+    elif done:
+        progress = f"{human_size(done)} من حجم غير معروف"
+    else:
+        progress = "بانتظار بدء النقل"
+    eta = human_time((total - done) / speed) if total and speed > 0 and done < total else ("اكتمل" if total and done >= total else "—")
+    speed_text = f"{human_size(speed)}/ث" if speed > 0 else "—"
+    return f"   {phase}: {progress}\n   ⚡ {speed_text} · المتبقي: {eta}"
+
+
+def dashboard_snapshot():
+    running = list(active_tasks.values())
+    queued = list(queued_tasks.values())
+    waiting = [item for item in pending_downloads.values() if item.get("user_id") == OWNER_ID]
+    failed = list(failed_tasks.values())[-3:]
+    lines = [
+        "📊 لوحة DriveSaverBot",
+        f"⬇️/⬆️ نشطة: {len(running)}   ⏳ في الانتظار: {len(queued)}   🎬 اختيار الجودة: {len(waiting)}",
+        "",
+    ]
+    for task in running[:8]:
+        task_id = task.get("id", "?")
+        label = task.get("name") or task.get("url") or "ملف Telegram"
+        label = str(label).split("?")[0][:48]
+        lines.extend([f"🔄 {task_id} · {str(task.get('status', 'قيد التنفيذ'))}", f"   {label}", task_progress_line(task), ""])
+    for task in queued[:8]:
+        task_id = task.get("id", "?")
+        label = str(task.get("name") or task.get("url") or "ملف") .split("?")[0][:48]
+        lines.append(f"⏳ {task_id} · {label} · في الانتظار")
+    for item in waiting[:5]:
+        lines.append(f"🎬 اختيار الجودة · {str(item.get('url', 'رابط')).split('?')[0][:48]}")
+    if failed:
+        lines.extend(["", "⚠️ آخر المهام الفاشلة:"])
+        for task in failed:
+            lines.append(f"❌ {task.get('id')} · {str(task.get('name') or task.get('url') or 'مهمة').split('?')[0][:45]}")
+    if not running and not queued and not waiting and not failed:
+        lines.append("لا توجد مهام حاليًا. أرسل رابطًا أو ملفًا للبدء.")
+    lines.extend(["", "تتحدث اللوحة تلقائيًا أثناء النقل."])
+    return "\n".join(lines)
+
+
+def dashboard_keyboard():
+    rows = []
+    for task_id, task in list(active_tasks.items())[:8]:
+        rows.append([
+            InlineKeyboardButton(f"🔎 تفاصيل {task_id}", callback_data=f"task_detail|{task_id}"),
+            InlineKeyboardButton(f"🛑 إلغاء {task_id}", callback_data=f"task_cancel|{task_id}"),
+        ])
+    for task_id, task in list(queued_tasks.items())[:8]:
+        rows.append([
+            InlineKeyboardButton(f"🔎 تفاصيل {task_id}", callback_data=f"task_detail|{task_id}"),
+            InlineKeyboardButton(f"🛑 إلغاء {task_id}", callback_data=f"task_cancel|{task_id}"),
+        ])
+    for task_id, task in list(failed_tasks.items())[-3:]:
+        if task_id in retry_task_specs:
+            rows.append([InlineKeyboardButton(f"🔁 إعادة محاولة {task_id}", callback_data=f"task_retry|{task_id}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث اللوحة", callback_data="dashboard_refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def refresh_dashboard(bot, force=False):
+    global dashboard_message_id, dashboard_chat_id, dashboard_last_update
+    if not dashboard_chat_id:
+        return
+    now = time.monotonic()
+    if not force and now - dashboard_last_update < 1.5:
+        return
+    dashboard_last_update = now
+    text = dashboard_snapshot()
+    markup = dashboard_keyboard()
+    if dashboard_message_id is None:
+        sent = await bot.send_message(chat_id=dashboard_chat_id, text=text, reply_markup=markup, disable_web_page_preview=True)
+        dashboard_message_id = sent.message_id
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=dashboard_chat_id, message_id=dashboard_message_id,
+            text=text, reply_markup=markup, disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        # Telegram returns an error when the generated text and keyboard are unchanged.
+        if "message is not modified" not in str(exc).lower():
+            logger.debug("Dashboard refresh skipped: %s", exc)
+
+
+def schedule_dashboard_refresh(loop, bot):
+    if dashboard_message_id is None or dashboard_chat_id is None:
+        return
+    loop.call_soon_threadsafe(lambda: asyncio.create_task(refresh_dashboard(bot)))
 
 
 def is_youtube_url(url):
@@ -418,7 +536,7 @@ async def cmd_help(update, context):
         "📖 *المساعدة*\n\n"
         "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
         "📎 أرسل ملفاً → يُحفظ في Drive\n"
-        "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📋 /queue — لوحة تقدم موحدة للمهام\n"
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
         "📒 /colab — فتح دفتر Google Colab\n"
@@ -428,26 +546,11 @@ async def cmd_help(update, context):
 
 
 async def cmd_queue(update, context):
+    global dashboard_chat_id
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    running = list(active_tasks.values())
-    queued = list(queued_tasks.values())
-    waiting = [item for item in pending_downloads.values() if item.get("user_id") == OWNER_ID]
-    lines = [
-        "📋 حالة العمليات",
-        f"🔄 نشطة: {len(running)}",
-        f"⏳ في طابور التنفيذ: {len(queued)}",
-        f"🎬 تنتظر اختيار الجودة: {len(waiting)}",
-    ]
-    for item in running[:10]:
-        label = item.get("name") or item.get("url", "ملف")
-        lines.append(f"• {item['id']} — {item.get('status', 'قيد التنفيذ')} — {label[:60]}")
-    for item in queued[:10]:
-        lines.append(f"• {item['id']} — انتظار — {item.get('url', 'ملف')[:70]}")
-    for item in waiting[:10]:
-        lines.append(f"• بانتظار اختيار الجودة — {item.get('url', 'رابط')[:70]}")
-    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
-
+    dashboard_chat_id = update.effective_chat.id
+    await refresh_dashboard(context.bot, force=True)
 
 async def cmd_status(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -562,6 +665,53 @@ async def handle_callback(update, context):
         else:
             await q.edit_message_text("❌ انتهى الطلب أو لا تملك صلاحية إلغائه.")
         return
+    if data == "dashboard_refresh":
+        await refresh_dashboard(context.bot, force=True)
+        return
+    if data.startswith("task_detail|"):
+        task_id = data.split("|", 1)[1]
+        task = active_tasks.get(task_id) or queued_tasks.get(task_id) or failed_tasks.get(task_id)
+        if not task:
+            await q.answer("انتهت صلاحية المهمة أو لم تعد موجودة.", show_alert=True)
+            return
+        detail = [
+            f"تفاصيل المهمة {task_id}",
+            f"الحالة: {task.get('status', 'غير معروفة')}",
+            f"الاسم: {str(task.get('name') or 'غير معروف')[:120]}",
+        ]
+        if task.get("url"):
+            detail.append(f"الرابط: {str(task['url']).split('?')[0][:250]}")
+        detail.append(task_progress_line(task))
+        if task.get("error"):
+            detail.append(f"الخطأ: {str(task['error'])[:250]}")
+        await q.message.reply_text("\\n".join(detail), disable_web_page_preview=True)
+        return
+    if data.startswith("task_cancel|"):
+        task_id = data.split("|", 1)[1]
+        if task_id not in active_tasks and task_id not in queued_tasks:
+            await q.message.reply_text("المهمة غير نشطة.")
+            return
+        cancel_flags[task_id] = True
+        await q.message.reply_text(f"🛑 طُلب إلغاء المهمة {task_id}.")
+        await refresh_dashboard(context.bot, force=True)
+        return
+    if data.startswith("task_retry|"):
+        task_id = data.split("|", 1)[1]
+        spec = retry_task_specs.get(task_id)
+        if not spec:
+            await q.message.reply_text("لا تتوفر بيانات كافية لإعادة هذه المهمة.")
+            return
+        if task_id in active_tasks or task_id in queued_tasks:
+            await q.message.reply_text("هذه المهمة ما زالت تعمل.")
+            return
+        retry_task_specs.pop(task_id, None)
+        failed_tasks.pop(task_id, None)
+        retry_message = await q.message.reply_text(f"🔁 إعادة محاولة المهمة {task_id}...")
+        fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
+        asyncio.create_task(do_download(fake_update, context, retry_message, spec["url"], spec.get("quality"), spec.get("info")))
+        await q.message.reply_text("🔁 بدأت إعادة المحاولة.")
+        await refresh_dashboard(context.bot, force=True)
+        return
     if data.startswith("large_cancel|"):
         await q.edit_message_text("تم إلغاء الإجراء. لم تُنشأ مهمة نقل.")
         return
@@ -595,6 +745,8 @@ async def do_download(update, context, msg, url, quality, info):
         "id": task_id, "user_id": uid, "url": url, "status": "في الانتظار",
         "started_at": started,
     }
+    retry_task_specs[task_id] = {"url": url, "quality": quality, "info": info}
+    await refresh_dashboard(context.bot, force=True)
     cancel_flags[task_id] = False
     is_video = bool(info and info.get("is_video"))
     persist_task({
@@ -613,6 +765,7 @@ async def do_download(update, context, msg, url, quality, info):
         "id": task_id, "user_id": uid, "url": url,
         "status": "تنزيل", "started_at": started,
     }
+    await refresh_dashboard(context.bot, force=True)
     persist_task({
         "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
         "is_video": is_video, "status": "started", "started_at": started,
@@ -643,6 +796,7 @@ async def do_download(update, context, msg, url, quality, info):
         else:
             text = f"⬇️ *تنزيل الملف*\n\nالمهمة: {task_id}\n💾 {human_size(done)}\n⚡ {human_size(speed)}/s"
         loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+        schedule_dashboard_refresh(loop, context.bot)
 
     try:
         with tempfile.TemporaryDirectory(prefix="drive-saver-") as tmp:
@@ -694,10 +848,13 @@ async def do_download(update, context, msg, url, quality, info):
                 pct = done / total * 100 if total else 0
                 text = f"📤 *رفع إلى Google Drive*\n\nالمهمة: {task_id}\nالتقدم: {pct:.1f}% — {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s\n⏱️ {human_time(now - upload_started)}"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+                schedule_dashboard_refresh(loop, context.bot)
 
             await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\n💾 {human_size(size)}\nالمهمة: {task_id}")
             result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress, cancelled)
             elapsed = time.time() - started
+            retry_task_specs.pop(task_id, None)
+            failed_tasks.pop(task_id, None)
             persist_task({
                 "task_id": task_id, "user_id": uid, "url": url,
                 "name": result["name"], "size": size, "status": "completed",
@@ -726,6 +883,7 @@ async def do_download(update, context, msg, url, quality, info):
                 pass
         else:
             logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
+            failed_tasks[task_id] = {"id": task_id, "user_id": uid, "url": url, "name": (retry_task_specs.get(task_id) or {}).get("name"), "status": "فشلت", "error": str(exc)[:500]}
             persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
             try:
                 await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
@@ -736,6 +894,7 @@ async def do_download(update, context, msg, url, quality, info):
         queued_tasks.pop(task_id, None)
         active_tasks.pop(task_id, None)
         transfer_semaphore.release()
+        await refresh_dashboard(context.bot, force=True)
 
 
 async def handle_telegram_file(update, context, file_obj):
@@ -763,6 +922,7 @@ async def handle_telegram_file(update, context, file_obj):
         "id": task_id, "user_id": uid, "status": "في الانتظار",
         "name": getattr(file_obj, "file_name", None), "started_at": started,
     }
+    await refresh_dashboard(context.bot, force=True)
     cancel_flags[task_id] = False
     persist_task({
         "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
@@ -782,6 +942,7 @@ async def handle_telegram_file(update, context, file_obj):
         "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
         "name": getattr(file_obj, "file_name", None), "started_at": started,
     }
+    await refresh_dashboard(context.bot, force=True)
     persist_task({
         "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
         "file_name": getattr(file_obj, "file_name", None),
@@ -820,6 +981,7 @@ async def handle_telegram_file(update, context, file_obj):
                 sample["last_edit"] = now
                 text = f"📤 رفع إلى Drive: {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+                schedule_dashboard_refresh(loop, context.bot)
 
             result = await asyncio.to_thread(upload_to_drive, path, upload_progress, lambda: cancel_flags.get(task_id, False))
             elapsed = time.time() - started
@@ -834,6 +996,14 @@ async def handle_telegram_file(update, context, file_obj):
                 parse_mode="Markdown", disable_web_page_preview=True,
             )
     except Exception as exc:
+        if "__CANCELLED__" in str(exc) or cancel_flags.get(task_id, False):
+            persist_task({"task_id": task_id, "user_id": uid, "status": "cancelled"})
+            try:
+                if msg is not None:
+                    await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+            except Exception:
+                pass
+            return
         logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
         persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
         try:
@@ -848,6 +1018,7 @@ async def handle_telegram_file(update, context, file_obj):
         queued_tasks.pop(task_id, None)
         active_tasks.pop(task_id, None)
         transfer_semaphore.release()
+        await refresh_dashboard(context.bot, force=True)
 
 def latest_task_records():
     latest = {}
