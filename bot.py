@@ -713,6 +713,18 @@ async def cmd_retry(update, context):
             "أرسل الرابط مجددًا لأسباب أمنية."
         )
         return
+    persist_task({
+        "task_id": target,
+        "user_id": OWNER_ID,
+        "url": record.get("url"),
+        "file_id": record.get("file_id"),
+        "file_name": record.get("file_name"),
+        "file_unique_id": record.get("file_unique_id"),
+        "quality": record.get("quality"),
+        "is_video": record.get("is_video", False),
+        "status": "retry_scheduled",
+        "retry_scheduled_at": time.time(),
+    })
     if record.get("url"):
         url = record["url"]
         duplicate = find_duplicate_url_task(url)
@@ -1242,7 +1254,7 @@ async def configure_bot_menu(application):
     latest = latest_task_records()
     recoverable = [
         item for item in latest.values()
-        if item.get("status") in {"queued", "started", "uploading", "telegram_download_started", "uploading_telegram"}
+        if item.get("status") in {"queued", "started", "uploading", "telegram_download_started", "uploading_telegram", "retry_scheduled"}
         and (item.get("url") or item.get("file_id"))
     ]
     for item in recoverable:
