@@ -332,8 +332,60 @@ async def cmd_start(update, context):
 async def cmd_help(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    await update.message.reply_text("📖 *المساعدة*\n\n🔗 أرسل رابطاً → اختر الجودة → يُحفظ في Drive\n📎 أرسل ملفاً → يُحفظ في Drive\n🛑 /cancel — إلغاء التحميل الحالي\n🆔 /id — معرف المحادثة", parse_mode="Markdown")
+    await update.message.reply_text(
+        "📖 *المساعدة*\n\n"
+        "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
+        "📎 أرسل ملفاً → يُحفظ في Drive\n"
+        "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📊 /status — حالة البوت ومساحة Colab\n"
+        "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
+        "📒 /colab — فتح دفتر Google Colab\n"
+        "🆔 /id — معرف Telegram",
+        parse_mode="Markdown",
+    )
 
+
+async def cmd_queue(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    running = list(active_tasks.values())
+    waiting = [item for item in pending_downloads.values() if item.get("user_id") == OWNER_ID]
+    lines = ["📋 *حالة العمليات*", f"🔄 نشطة: {len(running)}", f"⏳ تنتظر اختيار الجودة: {len(waiting)}"]
+    for item in running[:10]:
+        label = item.get("name") or item.get("url", "ملف")
+        lines.append(f"• {item['id']} — {item.get('status', 'قيد التنفيذ')} — {label[:60]}")
+    for item in waiting[:10]:
+        lines.append(f"• بانتظار الاختيار — {item.get('url', 'رابط')[:70]}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def cmd_status(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    try:
+        usage = shutil.disk_usage("/content")
+        disk = f"{human_size(usage.free)} متاحة من {human_size(usage.total)}"
+    except OSError:
+        disk = "غير متاحة"
+    await update.message.reply_text(
+        "🧠 *حالة DriveSaverBot*\n\n"
+        f"🔄 عمليات نشطة: {len(active_tasks)}\n"
+        f"💽 مساحة Colab: {disk}\n"
+        f"📦 حجم جزء رفع Drive: {human_size(DRIVE_UPLOAD_CHUNK_BYTES)}\n"
+        "☁️ بيئة التشغيل: Google Colab",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_colab(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    url = "https://colab.research.google.com/github/Hus-GPT/drive-saver-bot/blob/main/colab/DriveSaverBot_Colab.ipynb"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📒 فتح دفتر Google Colab", url=url)]])
+    await update.message.reply_text(
+        "افتح الدفتر لتشغيل Colab. إذا كانت الجلسة متوقفة، شغّل خلية التشغيل يدويًا.",
+        reply_markup=keyboard,
+    )
 
 async def cmd_id(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
@@ -352,17 +404,33 @@ async def cmd_stats(update, context):
 async def cmd_cancel(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    cancel_flags[update.effective_user.id] = True
-    await update.message.reply_text("🛑 جارٍ الإلغاء...")
-
+    target = context.args[0] if context.args else None
+    matches = [
+        task_id for task_id, task in active_tasks.items()
+        if task.get("user_id") == OWNER_ID and (target is None or task_id == target)
+    ]
+    if target and not matches:
+        await update.message.reply_text("لم أجد مهمة نشطة بهذا الرقم. استخدم /queue لعرض أرقام المهام.")
+        return
+    if not matches:
+        await update.message.reply_text("لا توجد عمليات نشطة لإلغائها.")
+        return
+    for task_id in matches:
+        cancel_flags[task_id] = True
+    await update.message.reply_text("🛑 طُلب إلغاء: " + ", ".join(matches))
 
 async def handle_message(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
     uid = update.effective_user.id
     authenticated_users.add(uid)
-    if update.message.document or update.message.video or update.message.audio:
-        await handle_telegram_file(update, context, update.message.document or update.message.video or update.message.audio)
+    message = update.message
+    file_obj = (
+        message.document or message.video or message.audio or message.animation
+        or message.voice or message.video_note or (message.photo[-1] if message.photo else None)
+    )
+    if file_obj:
+        await handle_telegram_file(update, context, file_obj)
         return
     text = (update.message.text or "").strip()
     if text.startswith(("http://", "https://")):
@@ -397,9 +465,13 @@ async def handle_callback(update, context):
     if data.startswith("cancel|"):
         sid = data.split("|", 1)[1]
         p = pending_downloads.pop(sid, None)
-        if p:
-            cancel_flags[p["user_id"]] = True
-        await q.edit_message_text("❌ تم الإلغاء.")
+        if p and p.get("user_id") == uid:
+            await q.edit_message_text("❌ تم إلغاء طلب التنزيل.")
+        else:
+            await q.edit_message_text("❌ انتهى الطلب أو لا تملك صلاحية إلغائه.")
+        return
+    if data.startswith("large_cancel|"):
+        await q.edit_message_text("تم إلغاء الإجراء. لم تُنشأ مهمة نقل.")
         return
     if data.startswith("dl|"):
         _, sid, quality = data.split("|", 2)
@@ -488,14 +560,16 @@ async def do_download(update, context, msg, url, quality, info):
 async def handle_telegram_file(update, context, file_obj):
     file_size = getattr(file_obj, "file_size", None) or 0
     if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 تحويل الملف إلى رابط", url="https://t.me/File2url_rbot")]
-        ])
+        sid = uuid.uuid4().hex[:8]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 إرسال / فتح بوت التحويل", url="https://t.me/File2url_rbot"),
+            InlineKeyboardButton("❌ إلغاء", callback_data=f"large_cancel|{sid}"),
+        ]])
         await update.message.reply_text(
-            "📦 *الملف كبير جدًا*\n\n"
+            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\n\n"
             f"💾 الحجم: {human_size(file_size)}\n"
-            "⚠️ Telegram لا يسمح للبوت بتنزيل الملفات الأكبر من 20MB مباشرة.\n\n"
-            "حوّل الملف إلى رابط عبر الزر أدناه، ثم أرسل الرابط إلى DriveSaverBot وسأحفظه في Google Drive.",
+            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\n\n"
+            "هل تريد المتابعة؟",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
@@ -539,6 +613,9 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
