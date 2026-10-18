@@ -715,14 +715,38 @@ async def handle_telegram_file(update, context, file_obj):
     uid = update.effective_user.id
     task_id = uuid.uuid4().hex[:8]
     started = time.time()
+    queued_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "status": "في الانتظار",
+        "name": getattr(file_obj, "file_name", None), "started_at": started,
+    }
+    cancel_flags[task_id] = False
+    persist_task({
+        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "file_name": getattr(file_obj, "file_name", None),
+        "file_unique_id": getattr(file_obj, "file_unique_id", None),
+        "status": "queued", "started_at": started,
+    })
+    await transfer_semaphore.acquire()
+    queued_tasks.pop(task_id, None)
+    if cancel_flags.get(task_id, False):
+        persist_task({"task_id": task_id, "user_id": uid, "file_id": file_obj.file_id, "status": "cancelled"})
+        cancel_flags.pop(task_id, None)
+        transfer_semaphore.release()
+        await update.message.reply_text("🛑 أُلغيت المهمة قبل بدء النقل.")
+        return
     active_tasks[task_id] = {
         "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
         "name": getattr(file_obj, "file_name", None), "started_at": started,
     }
-    cancel_flags[task_id] = False
-    persist_task({"task_id": task_id, "user_id": uid, "status": "telegram_download_started", "started_at": started})
-    msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\nالمهمة: {task_id}")
+    persist_task({
+        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "file_name": getattr(file_obj, "file_name", None),
+        "file_unique_id": getattr(file_obj, "file_unique_id", None),
+        "status": "telegram_download_started", "started_at": started,
+    })
+    msg = None
     try:
+        msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\nالمهمة: {task_id}")
         tg = await context.bot.get_file(file_obj.file_id)
         raw_name = getattr(file_obj, "file_name", None) or f"telegram_{getattr(file_obj, 'file_unique_id', task_id)}"
         name = Path(raw_name).name
@@ -732,6 +756,11 @@ async def handle_telegram_file(update, context, file_obj):
             await tg.download_to_drive(path)
             size = os.path.getsize(path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
+            persist_task({
+                "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+                "file_name": name, "file_unique_id": getattr(file_obj, "file_unique_id", None),
+                "size": size, "status": "uploading_telegram",
+            })
             upload_started = time.time()
             sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
             loop = asyncio.get_running_loop()
@@ -764,12 +793,17 @@ async def handle_telegram_file(update, context, file_obj):
         logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
         persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
         try:
-            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
+            if msg is not None:
+                await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
+            else:
+                await update.message.reply_text(f"❌ فشلت المهمة {task_id}: {str(exc)[:250]}")
         except Exception:
             pass
     finally:
         cancel_flags.pop(task_id, None)
+        queued_tasks.pop(task_id, None)
         active_tasks.pop(task_id, None)
+        transfer_semaphore.release()
 
 def latest_task_records():
     latest = {}
@@ -807,29 +841,44 @@ async def configure_bot_menu(application):
     latest = latest_task_records()
     recoverable = [
         item for item in latest.values()
-        if item.get("status") in {"queued", "started", "uploading"}
-        and item.get("url")
+        if item.get("status") in {"queued", "started", "uploading", "telegram_download_started", "uploading_telegram"}
+        and (item.get("url") or item.get("file_id"))
     ]
     for item in recoverable:
         old_id = item.get("task_id")
-        url = item["url"]
-        info = {"is_video": True} if item.get("is_video") else None
         try:
-            message = await application.bot.send_message(
-                chat_id=OWNER_ID,
-                text=f"♻️ استعادة مهمة انقطعت سابقًا: {url[:180]}",
-                disable_web_page_preview=True,
-            )
-            fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
-            asyncio.create_task(
-                do_download(fake_update, application, message, url, item.get("quality"), info)
-            )
+            if item.get("file_id"):
+                async def reply_text(text, **kwargs):
+                    return await application.bot.send_message(chat_id=OWNER_ID, text=text, **kwargs)
+                fake_message = SimpleNamespace(reply_text=reply_text)
+                fake_update = SimpleNamespace(
+                    effective_user=SimpleNamespace(id=OWNER_ID), message=fake_message
+                )
+                fake_file = SimpleNamespace(
+                    file_id=item["file_id"], file_size=0,
+                    file_name=item.get("file_name"),
+                    file_unique_id=item.get("file_unique_id", old_id),
+                )
+                asyncio.create_task(handle_telegram_file(fake_update, application, fake_file))
+            else:
+                message = await application.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text="♻️ استعادة مهمة انقطعت سابقًا.",
+                    disable_web_page_preview=True,
+                )
+                info = {"is_video": True} if item.get("is_video") else None
+                fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
+                asyncio.create_task(
+                    do_download(fake_update, application, message, item["url"], item.get("quality"), info)
+                )
             persist_task({
-                "task_id": old_id, "user_id": OWNER_ID, "url": url,
-                "status": "recovery_scheduled", "recovered_as_new_task": True,
+                "task_id": old_id, "user_id": OWNER_ID, "url": item.get("url"),
+                "file_id": item.get("file_id"), "status": "recovery_scheduled",
+                "recovered_as_new_task": True,
             })
         except Exception as exc:
             logger.warning("Could not recover task %s: %s", old_id, exc)
+
 
 
 def main():
