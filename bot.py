@@ -426,7 +426,7 @@ def human_time(s):
 
 def extract_first_url(text):
     """Extract the first URL from a shared message, ignoring trailing punctuation."""
-    for match in re.finditer(r"https?://[^\\s<>]+", text or "", re.IGNORECASE):
+    for match in re.finditer(r"https?://[^\s<>]+", text or "", re.IGNORECASE):
         candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}）»”’")
         parsed = urlparse(candidate)
         if parsed.scheme in ("http", "https") and parsed.netloc:
@@ -1234,7 +1234,7 @@ async def handle_link(update, context, url):
     info = await fetch_url_info_safe(url)
     if not info.get("is_video"):
         if info.get("rate_limited") and info.get("youtube"):
-            await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\\n\\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
+                        await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
             return
         if info.get("error") and is_video_platform_url(url):
             # Metadata extraction can fail temporarily while the platform's direct
