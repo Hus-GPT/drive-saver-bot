@@ -1092,6 +1092,15 @@ async def do_download(update, context, msg, url, quality, info):
         transfer_semaphore.release()
 
 
+def find_duplicate_telegram_task(file_unique_id):
+    if not file_unique_id:
+        return None
+    for task_id, task in {**active_tasks, **queued_tasks}.items():
+        if task.get("user_id") == OWNER_ID and task.get("file_unique_id") == file_unique_id:
+            return task_id
+    return None
+
+
 async def handle_telegram_file(update, context, file_obj):
     file_size = getattr(file_obj, "file_size", None) or 0
     if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
@@ -1111,11 +1120,20 @@ async def handle_telegram_file(update, context, file_obj):
         return
 
     uid = update.effective_user.id
+    file_unique_id = getattr(file_obj, "file_unique_id", None)
+    duplicate_id = find_duplicate_telegram_task(file_unique_id)
+    if duplicate_id:
+        await update.message.reply_text(
+            f"♻️ هذا الملف موجود بالفعل في قائمة العمل.\\n🆔 المهمة: {duplicate_id}\\nلم أضف مهمة مكررة."
+        )
+        return
     task_id = uuid.uuid4().hex[:8]
     started = time.time()
     queued_tasks[task_id] = {
         "id": task_id, "user_id": uid, "status": "في الانتظار",
-        "name": getattr(file_obj, "file_name", None), "started_at": started,
+        "name": getattr(file_obj, "file_name", None),
+        "file_unique_id": file_unique_id,
+        "started_at": started,
     }
     cancel_flags[task_id] = False
     persist_task({
@@ -1134,7 +1152,9 @@ async def handle_telegram_file(update, context, file_obj):
         return
     active_tasks[task_id] = {
         "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
-        "name": getattr(file_obj, "file_name", None), "started_at": started,
+        "name": getattr(file_obj, "file_name", None),
+        "file_unique_id": file_unique_id,
+        "started_at": started,
     }
     persist_task({
         "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
