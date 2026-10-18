@@ -1198,16 +1198,17 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                     result = await asyncio.to_thread(
                         upload_to_drive, extracted_path, None, cancelled, destination_folder_id
                     )
+                    result["archive_path"] = str(relative_parent / result["name"]) if str(relative_parent) != "." else result["name"]
                     results.append(result)
                     persist_task({
                         "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url,
-                        "name": result["name"], "size": extracted_size,
+                        "name": result["name"], "archive_path": result["archive_path"], "size": extracted_size,
                         "drive_file_id": result["id"], "drive_link": result["link"],
                         "status": "archive_member_completed",
                         "already_exists": result.get("already_exists", False),
                     })
                 links = "\n".join(
-                    f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
+                    f"• {item.get('archive_path') or item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
                     for item in results
                 )
                 persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
@@ -1373,10 +1374,11 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
                         upload_to_drive, extracted_path, None,
                         lambda: cancel_flags.get(task_id, False), destination_folder_id,
                     )
+                    result["archive_path"] = str(relative_parent / result["name"]) if str(relative_parent) != "." else result["name"]
                     results.append(result)
                     persist_task({
                         "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_name": Path(extracted_path).name,
-                        "size": extracted_size, "drive_file_id": result["id"],
+                        "archive_path": result["archive_path"], "size": extracted_size, "drive_file_id": result["id"],
                         "drive_link": result["link"], "status": "archive_member_completed",
                         "already_exists": result.get("already_exists", False),
                     })
