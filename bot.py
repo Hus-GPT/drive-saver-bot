@@ -684,7 +684,20 @@ async def cmd_stats(update, context):
         return
     uid = update.effective_user.id
     pending = sum(1 for p in pending_downloads.values() if p["user_id"] == uid)
-    await update.message.reply_text(f"📊 *إحصائياتك*\n\n👤 معرّفك: `{uid}`\n🔄 تحميلات معلقة: {pending}\n✅ المصادقة: {'نعم' if uid in authenticated_users else 'لا'}", parse_mode="Markdown")
+    speeds = [
+        float(task.get("download_speed") or 0) + float(task.get("upload_speed") or 0)
+        for task in active_tasks.values() if task.get("user_id") == uid
+    ]
+    total_speed = sum(speeds)
+    await update.message.reply_text(
+        f"📊 *إحصائياتك*\n\n👤 معرّفك: `{uid}`\n"
+        f"🔄 عمليات نشطة: {sum(1 for task in active_tasks.values() if task.get('user_id') == uid)}\n"
+        f"⏳ في الانتظار: {sum(1 for task in queued_tasks.values() if task.get('user_id') == uid)}\n"
+        f"🎬 تنتظر اختيار الجودة: {pending}\n"
+        f"⚡ إجمالي سرعة النقل الحالية: {human_size(total_speed)}/ث\n"
+        f"✅ المصادقة: {'نعم' if uid in authenticated_users else 'لا'}",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_retry(update, context):
@@ -732,7 +745,7 @@ async def cmd_retry(update, context):
         info = {"is_video": True} if record.get("is_video") else None
         fake_update = SimpleNamespace(effective_user=update.effective_user)
         context.application.create_task(
-            do_download(fake_update, context.application, message, url, record.get("quality"), info),
+            do_download(fake_update, context.application, message, url, record.get("quality"), info, recovery_parent_id=target),
             name=f"retry-download-{target}",
         )
         return
@@ -758,7 +771,7 @@ async def cmd_retry(update, context):
         file_name=record.get("file_name"), file_unique_id=file_unique_id or target,
     )
     context.application.create_task(
-        handle_telegram_file(fake_update, context.application, fake_file),
+        handle_telegram_file(fake_update, context.application, fake_file, recovery_parent_id=target),
         name=f"retry-telegram-{target}",
     )
     await update.message.reply_text(f"🔁 أُعيدت جدولة ملف Telegram من المهمة {target}.")
@@ -906,7 +919,7 @@ async def safe_edit(msg, text):
         pass
 
 
-async def do_download(update, context, msg, url, quality, info):
+async def do_download(update, context, msg, url, quality, info, recovery_parent_id=None):
     uid = update.effective_user.id
     task_id = uuid.uuid4().hex[:8]
     started = time.time()
@@ -919,7 +932,7 @@ async def do_download(update, context, msg, url, quality, info):
     cancel_flags[task_id] = False
     is_video = bool(info and info.get("is_video"))
     persist_task({
-        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url, "quality": quality,
         "is_video": is_video, "status": "queued", "started_at": started,
     })
     await transfer_semaphore.acquire()
@@ -1095,7 +1108,7 @@ def find_duplicate_telegram_task(file_unique_id):
     return None
 
 
-async def handle_telegram_file(update, context, file_obj):
+async def handle_telegram_file(update, context, file_obj, recovery_parent_id=None):
     file_size = getattr(file_obj, "file_size", None) or 0
     if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
         sid = uuid.uuid4().hex[:8]
@@ -1131,7 +1144,7 @@ async def handle_telegram_file(update, context, file_obj):
     }
     cancel_flags[task_id] = False
     persist_task({
-        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_id": file_obj.file_id,
         "file_name": getattr(file_obj, "file_name", None),
         "file_unique_id": getattr(file_obj, "file_unique_id", None),
         "status": "queued", "started_at": started,
@@ -1242,6 +1255,31 @@ async def handle_telegram_file(update, context, file_obj):
         active_tasks.pop(task_id, None)
         transfer_semaphore.release()
 
+def get_recoverable_task_records(latest):
+    """Return interrupted tasks, avoiding replaying a parent once its recovery child is journaled."""
+    recoverable_statuses = {
+        "queued", "started", "uploading", "telegram_download_started",
+        "uploading_telegram", "retry_scheduled", "recovery_scheduled",
+    }
+    result = []
+    for item in latest.values():
+        if item.get("status") not in recoverable_statuses:
+            continue
+        if not (item.get("url") or item.get("file_id")):
+            continue
+        task_id = item.get("task_id")
+        if item.get("status") in {"retry_scheduled", "recovery_scheduled"}:
+            child_exists = any(
+                other.get("recovery_parent_id") == task_id
+                for other in latest.values()
+                if other.get("task_id") != task_id
+            )
+            if child_exists:
+                continue
+        result.append(item)
+    return result
+
+
 def latest_task_records():
     latest = {}
     path = Path(TASK_LOG_PATH)
@@ -1278,11 +1316,7 @@ async def configure_bot_menu(application):
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     latest = latest_task_records()
-    recoverable = [
-        item for item in latest.values()
-        if item.get("status") in {"queued", "started", "uploading", "telegram_download_started", "uploading_telegram", "retry_scheduled"}
-        and (item.get("url") or item.get("file_id"))
-    ]
+    recoverable = get_recoverable_task_records(latest)
     for item in recoverable:
         old_id = item.get("task_id")
         try:
@@ -1298,7 +1332,7 @@ async def configure_bot_menu(application):
                     file_name=item.get("file_name"),
                     file_unique_id=item.get("file_unique_id", old_id),
                 )
-                asyncio.create_task(handle_telegram_file(fake_update, application, fake_file))
+                asyncio.create_task(handle_telegram_file(fake_update, application, fake_file, recovery_parent_id=old_id))
             else:
                 message = await application.bot.send_message(
                     chat_id=OWNER_ID,
@@ -1308,7 +1342,7 @@ async def configure_bot_menu(application):
                 info = {"is_video": True} if item.get("is_video") else None
                 fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
                 asyncio.create_task(
-                    do_download(fake_update, application, message, item["url"], item.get("quality"), info)
+                    do_download(fake_update, application, message, item["url"], item.get("quality"), info, recovery_parent_id=old_id)
                 )
             persist_task({
                 "task_id": old_id, "user_id": OWNER_ID, "url": item.get("url"),
