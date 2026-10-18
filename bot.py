@@ -763,11 +763,11 @@ async def handle_callback(update, context):
         if not task:
             await q.edit_message_text("انتهت هذه المهمة أو لم تعد نشطة. أرسل /progress لعرض المهام الحالية.")
             return
-        await q.edit_message_text(
+        await q.message.reply_text(
             format_task_progress(task),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔄 تحديث", callback_data=f"progress|{task_id}"),
-                InlineKeyboardButton("📋 كل المهام", callback_data="progress_refresh"),
+                InlineKeyboardButton("📋 لوحة المهام", callback_data="progress_refresh"),
             ]]),
             disable_web_page_preview=True,
         )
