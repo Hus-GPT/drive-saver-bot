@@ -653,7 +653,7 @@ class UnifiedIntakeTests(unittest.TestCase):
                 return "/tmp/sample.mp4"
         with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
             bot.download_video("https://example.com/video", "/tmp", "best")
-        self.assertEqual(captured["format"], "bestvideo*+bestaudio/best")
+        self.assertEqual(captured["format"], "bestvideo+bestaudio/best")
 
     def test_numeric_quality_download_keeps_requested_height_cap(self):
         captured = {}
