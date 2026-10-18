@@ -46,6 +46,7 @@ MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DRIVE_UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024  # 32 MiB, multiple of 256 KiB
 TASK_LOG_PATH = os.environ.get('TASK_LOG_PATH', '/content/drive/MyDrive/.drive_saver_bot/tasks.jsonl')
 TASK_LOG_LOCK = threading.Lock()
+DRIVE_FOLDER_LOCK = threading.Lock()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -196,7 +197,50 @@ def extract_archive_contents(file_path, work_dir):
     return members
 
 
-def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
+def ensure_drive_folder_path(relative_directory, service=None):
+    """Create/reuse a nested folder path beneath Auto Downloads."""
+    relative_path = Path(str(relative_directory or "."))
+    parts = [part for part in relative_path.parts if part not in ("", ".", os.sep)]
+    if any(part == ".." for part in parts) or relative_path.is_absolute():
+        raise RuntimeError("مسار المجلد داخل الأرشيف غير آمن.")
+    service = service or drive_service or get_drive_service()
+    parent_id = DRIVE_FOLDER_ID
+    with DRIVE_FOLDER_LOCK:
+        for part in parts:
+            escaped = part.replace("\\", "\\\\").replace("'", "\\'")
+            query = (
+                "trashed = false and mimeType = 'application/vnd.google-apps.folder' "
+                f"and name = '{escaped}' and '{parent_id}' in parents"
+            )
+            matches = service.files().list(
+                q=query, pageSize=100, fields="files(id, name)"
+            ).execute(num_retries=3).get("files", [])
+            folder = next((item for item in matches if item.get("name") == part), None)
+            if folder:
+                parent_id = folder["id"]
+                continue
+            created = service.files().create(
+                body={
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent_id],
+                },
+                fields="id, name",
+            ).execute(num_retries=3)
+            if not created.get("id"):
+                raise RuntimeError(f"تعذر إنشاء مجلد Drive: {part}")
+            parent_id = created["id"]
+    return parent_id
+
+
+def archive_member_parent_id(extracted_path, archive_path, work_dir):
+    stem = re.sub(r"[^A-Za-z0-9_-]", "_", Path(archive_path).stem)[:80]
+    extraction_root = Path(work_dir) / ("extracted_" + stem)
+    relative_parent = Path(extracted_path).parent.relative_to(extraction_root)
+    return relative_parent
+
+
+def upload_to_drive(file_path, progress_cb=None, cancel_check=None, destination_folder_id=None):
     """Avoid duplicate uploads, use resumable chunks, and verify the saved file."""
     expected_size = os.path.getsize(file_path)
     fingerprint = sha256_file(file_path)
@@ -222,7 +266,7 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
 
     metadata = {
         "name": Path(file_path).name,
-        "parents": [DRIVE_FOLDER_ID],
+        "parents": [destination_folder_id or DRIVE_FOLDER_ID],
         "appProperties": {"sha256": fingerprint},
     }
     media = MediaFileUpload(
@@ -1144,8 +1188,16 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                     if cancelled():
                         raise RuntimeError("__CANCELLED__")
                     extracted_size = os.path.getsize(extracted_path)
-                    active_tasks[task_id].update({"status": "رفع محتويات الأرشيف", "name": Path(extracted_path).name, "size": extracted_size})
-                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, cancelled)
+                    relative_parent = archive_member_parent_id(extracted_path, file_path, tmp)
+                    destination_folder_id = await asyncio.to_thread(ensure_drive_folder_path, relative_parent)
+                    active_tasks[task_id].update({
+                        "status": "رفع محتويات الأرشيف",
+                        "name": str(Path(relative_parent) / Path(extracted_path).name),
+                        "size": extracted_size,
+                    })
+                    result = await asyncio.to_thread(
+                        upload_to_drive, extracted_path, None, cancelled, destination_folder_id
+                    )
                     results.append(result)
                     persist_task({
                         "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "url": url,
@@ -1315,7 +1367,12 @@ async def handle_telegram_file(update, context, file_obj, recovery_parent_id=Non
                     if cancel_flags.get(task_id, False):
                         raise RuntimeError("__CANCELLED__")
                     extracted_size = os.path.getsize(extracted_path)
-                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, lambda: cancel_flags.get(task_id, False))
+                    relative_parent = archive_member_parent_id(extracted_path, path, tmp)
+                    destination_folder_id = await asyncio.to_thread(ensure_drive_folder_path, relative_parent)
+                    result = await asyncio.to_thread(
+                        upload_to_drive, extracted_path, None,
+                        lambda: cancel_flags.get(task_id, False), destination_folder_id,
+                    )
                     results.append(result)
                     persist_task({
                         "task_id": task_id, "recovery_parent_id": recovery_parent_id, "user_id": uid, "file_name": Path(extracted_path).name,
