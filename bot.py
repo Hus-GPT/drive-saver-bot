@@ -420,7 +420,7 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
         ) as probe:
             if probe.status_code != 206:
                 return None
-            match = re.fullmatch(r"bytes\\s+0-0/(\\d+)", probe.headers.get("Content-Range", "").strip(), re.I)
+            match = re.fullmatch(r"bytes\s+0-0/(\d+)", probe.headers.get("Content-Range", "").strip(), re.I)
             if not match:
                 return None
             total = int(match.group(1))
@@ -459,7 +459,7 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
                     if response.status_code != 206:
                         raise IOError(f"Range request returned HTTP {response.status_code}")
                     match = re.fullmatch(
-                        r"bytes\\s+(\\d+)-(\\d+)/(\\d+)",
+                        r"bytes\s+(\d+)-(\d+)/(\d+)",
                         response.headers.get("Content-Range", "").strip(),
                         re.I,
                     )
@@ -551,7 +551,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
             with requests.get(url, stream=True, timeout=(15, 120), headers=headers) as response:
                 if response.status_code == 416 and existing:
                     content_range = response.headers.get("Content-Range", "")
-                    match = re.search(r"/(\\d+)$", content_range)
+                    match = re.search(r"/(\d+)$", content_range)
                     if match and int(match.group(1)) == existing:
                         return fp
                 response.raise_for_status()
@@ -559,7 +559,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
                 if not resume:
                     existing = 0
                 content_range = response.headers.get("Content-Range", "")
-                match = re.search(r"/(\\d+)$", content_range)
+                match = re.search(r"/(\d+)$", content_range)
                 content_length = int(response.headers.get("Content-Length", 0) or 0)
                 total = int(match.group(1)) if match else (content_length + existing if content_length else 0)
                 done = existing
