@@ -9,7 +9,6 @@ import shutil
 import json
 from pathlib import Path
 from urllib.parse import urlparse
-from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -87,7 +86,7 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-drive_service = get_drive_service()
+drive_service = None
 
 
 def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
@@ -99,7 +98,8 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
         resumable=True,
         chunksize=DRIVE_UPLOAD_CHUNK_BYTES,
     )
-    request = drive_service.files().create(
+    service = drive_service or get_drive_service()
+    request = service.files().create(
         body=metadata,
         media_body=media,
         fields="id, webViewLink, name, size",
@@ -113,7 +113,7 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
             progress_cb(min(expected_size, int(status.progress() * expected_size)), expected_size)
     if not response or not response.get("id"):
         raise RuntimeError("Google Drive لم يُرجع معرّف الملف بعد الرفع.")
-    verified = drive_service.files().get(
+    verified = service.files().get(
         fileId=response["id"],
         fields="id, webViewLink, name, size",
     ).execute(num_retries=3)
@@ -703,22 +703,8 @@ async def handle_telegram_file(update, context, file_obj):
         cancel_flags.pop(task_id, None)
         active_tasks.pop(task_id, None)
 
-app_flask = Flask(__name__)
-
-@app_flask.get("/")
-def health():
-    return "OK", 200
-
-
-def run_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    app_flask.run(host="0.0.0.0", port=port)
-
-
 def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
-    logger.info("🌐 Health server started")
-    logger.info("🚀 Starting DriveSaverBot...")
+    logger.info("🚀 Starting DriveSaverBot inside Google Colab...")
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(4).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
