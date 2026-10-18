@@ -466,7 +466,7 @@ def extract_first_url(text):
 def extract_urls(text):
     """Extract all unique HTTP(S) URLs in first-seen order."""
     urls, seen = [], set()
-    for match in re.finditer(r"https?://[^\\s<>]+", text or "", re.IGNORECASE):
+    for match in re.finditer(r"https?://[^\s<>]+", text or "", re.IGNORECASE):
         candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}»”’")
         parsed = urlparse(candidate)
         if parsed.scheme in ("http", "https") and parsed.netloc and candidate not in seen:
