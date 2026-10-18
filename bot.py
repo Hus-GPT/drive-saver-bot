@@ -5,10 +5,14 @@ import time
 import uuid
 import asyncio
 import threading
+import shutil
+import json
+import hashlib
+import re
+from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import urlparse
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MenuButtonCommands
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,15 +29,18 @@ import yt_dlp
 import requests
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-BOT_PASSWORD = os.environ["BOT_PASSWORD"]
+OWNER_ID = int(os.environ["OWNER_ID"])
 DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
-PROGRESS_UPDATE_INTERVAL = 3
+PROGRESS_UPDATE_INTERVAL = 2
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
 MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+DRIVE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MiB, multiple of 256 KiB
+TASK_LOG_PATH = os.environ.get('TASK_LOG_PATH', '/content/drive/MyDrive/.drive_saver_bot/tasks.jsonl')
+TASK_LOG_LOCK = threading.Lock()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,9 +50,25 @@ logger = logging.getLogger(__name__)
 
 authenticated_users = set()
 pending_downloads = {}
+queued_tasks = {}
+active_tasks = {}
+transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '2'))))
 cancel_flags = {}
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
+
+
+def persist_task(record):
+    """Append task history to Drive without storing credentials or tokens."""
+    try:
+        path = Path(TASK_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(record)
+        payload.setdefault("recorded_at", time.time())
+        with TASK_LOG_LOCK, path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("Could not persist task history: %s", exc)
 
 
 def get_drive_service():
@@ -68,18 +91,76 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-drive_service = get_drive_service()
+drive_service = None
 
 
-def upload_to_drive(file_path):
-    metadata = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
-    media = MediaFileUpload(file_path, resumable=True)
-    file = (
-        drive_service.files()
-        .create(body=metadata, media_body=media, fields="id, webViewLink, name, size")
-        .execute()
+def sha256_file(file_path):
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
+    """Avoid duplicate uploads, use resumable chunks, and verify the saved file."""
+    expected_size = os.path.getsize(file_path)
+    fingerprint = sha256_file(file_path)
+    service = drive_service or get_drive_service()
+    query = (
+        f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and "
+        f"appProperties has {{ key='sha256' and value='{fingerprint}' }}"
     )
-    return {"id": file.get("id"), "link": file.get("webViewLink"), "name": file.get("name"), "size": file.get("size")}
+    existing = service.files().list(
+        q=query, pageSize=1, fields="files(id, name, size, webViewLink, appProperties)"
+    ).execute(num_retries=3).get("files", [])
+    for item in existing:
+        if int(item.get("size", -1)) == expected_size:
+            if progress_cb:
+                progress_cb(expected_size, expected_size)
+            return {
+                "id": item["id"], "link": item.get("webViewLink"),
+                "name": item.get("name") or Path(file_path).name,
+                "size": expected_size, "already_exists": True,
+            }
+
+    metadata = {
+        "name": Path(file_path).name,
+        "parents": [DRIVE_FOLDER_ID],
+        "appProperties": {"sha256": fingerprint},
+    }
+    media = MediaFileUpload(
+        file_path, resumable=True, chunksize=DRIVE_UPLOAD_CHUNK_BYTES
+    )
+    request = service.files().create(
+        body=metadata, media_body=media, fields="id, webViewLink, name, size, appProperties"
+    )
+    response = None
+    while response is None:
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+        status, response = request.next_chunk(num_retries=3)
+        if status and progress_cb:
+            progress_cb(min(expected_size, int(status.progress() * expected_size)), expected_size)
+    if not response or not response.get("id"):
+        raise RuntimeError("Google Drive لم يُرجع معرّف الملف بعد الرفع.")
+    verified = service.files().get(
+        fileId=response["id"], fields="id, webViewLink, name, size, appProperties"
+    ).execute(num_retries=3)
+    actual_size = int(verified.get("size", -1))
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"فشل التحقق من الملف في Drive: المتوقع {expected_size} بايت، الموجود {actual_size} بايت."
+        )
+    if (verified.get("appProperties") or {}).get("sha256") != fingerprint:
+        raise RuntimeError("فشل التحقق من بصمة المحتوى بعد الرفع.")
+    return {
+        "id": verified.get("id"),
+        "link": verified.get("webViewLink") or response.get("webViewLink"),
+        "name": verified.get("name") or Path(file_path).name,
+        "size": actual_size,
+        "already_exists": False,
+    }
 
 
 def human_size(n):
@@ -211,6 +292,10 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         "progress_hooks": [hook],
         "postprocessors": pps,
         "merge_output_format": "mp4",
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "4")),
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
     })
     if ext:
         opts["final_ext"] = ext
@@ -227,20 +312,54 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
     filename = urlparse(url).path.rsplit("/", 1)[-1] or "downloaded_file"
     filename = "".join(c for c in filename if c.isalnum() or c in "._- ") or "downloaded_file"
     fp = os.path.join(out_dir, filename)
-    with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
-        done = 0
-        with open(fp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if cancel_check and cancel_check():
-                    raise Exception("__CANCELLED__")
-                if chunk:
-                    f.write(chunk)
-                    done += len(chunk)
-                    if progress_cb:
-                        progress_cb({"downloaded_bytes": done, "total_bytes": total})
-    return fp
+    base_headers = {"User-Agent": "Mozilla/5.0"}
+    attempts = 3
+
+    for attempt in range(attempts):
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+        existing = os.path.getsize(fp) if os.path.exists(fp) else 0
+        headers = dict(base_headers)
+        if existing:
+            headers["Range"] = f"bytes={existing}-"
+        try:
+            with requests.get(url, stream=True, timeout=(15, 120), headers=headers) as response:
+                if response.status_code == 416 and existing:
+                    content_range = response.headers.get("Content-Range", "")
+                    match = __import__("re").search(r"/(\d+)$", content_range)
+                    if match and int(match.group(1)) == existing:
+                        return fp
+                response.raise_for_status()
+                resume = existing > 0 and response.status_code == 206
+                if not resume:
+                    existing = 0
+                content_range = response.headers.get("Content-Range", "")
+                match = __import__("re").search(r"/(\d+)$", content_range)
+                content_length = int(response.headers.get("Content-Length", 0) or 0)
+                total = int(match.group(1)) if match else (content_length + existing if content_length else 0)
+                done = existing
+                mode = "ab" if resume else "wb"
+                with open(fp, mode) as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("__CANCELLED__")
+                        if chunk:
+                            handle.write(chunk)
+                            done += len(chunk)
+                            if progress_cb:
+                                progress_cb({"downloaded_bytes": done, "total_bytes": total})
+            if total and done != total:
+                raise IOError(f"Incomplete download: expected {total} bytes, received {done}.")
+            if done == 0:
+                raise IOError("The source returned an empty file.")
+            return fp
+        except Exception as exc:
+            if "__CANCELLED__" in str(exc) or attempt >= attempts - 1:
+                raise
+            delay = attempt + 1
+            logger.warning("Direct download attempt %s/%s failed; retrying in %ss: %s", attempt + 1, attempts, delay, exc)
+            time.sleep(delay)
+    raise RuntimeError("Direct download failed after retries.")
 
 
 async def youtube_gate():
@@ -274,40 +393,127 @@ async def fetch_url_info_safe(url):
 
 
 async def cmd_start(update, context):
-    await update.message.reply_text("👋 أهلاً بك في *DriveSaverBot*!\n\n🔐 أرسل كلمة السر للمتابعة.", parse_mode="Markdown")
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(
+        "👋 أهلاً بك في *DriveSaverBot*!\\n\\n"
+        "تم تقييد البوت على حساب المالك المصرّح به. أرسل رابطًا أو ملفًا للبدء، أو استخدم /help.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_help(update, context):
-    await update.message.reply_text("📖 *المساعدة*\n\n🔗 أرسل رابطاً → اختر الجودة → يُحفظ في Drive\n📎 أرسل ملفاً → يُحفظ في Drive\n🛑 /cancel — إلغاء التحميل الحالي\n🆔 /id — معرف المحادثة", parse_mode="Markdown")
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(
+        "📖 *المساعدة*\n\n"
+        "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
+        "📎 أرسل ملفاً → يُحفظ في Drive\n"
+        "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📊 /status — حالة البوت ومساحة Colab\n"
+        "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
+        "📒 /colab — فتح دفتر Google Colab\n"
+        "🆔 /id — معرف Telegram",
+        parse_mode="Markdown",
+    )
 
+
+async def cmd_queue(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    running = list(active_tasks.values())
+    queued = list(queued_tasks.values())
+    waiting = [item for item in pending_downloads.values() if item.get("user_id") == OWNER_ID]
+    lines = [
+        "📋 حالة العمليات",
+        f"🔄 نشطة: {len(running)}",
+        f"⏳ في طابور التنفيذ: {len(queued)}",
+        f"🎬 تنتظر اختيار الجودة: {len(waiting)}",
+    ]
+    for item in running[:10]:
+        label = item.get("name") or item.get("url", "ملف")
+        lines.append(f"• {item['id']} — {item.get('status', 'قيد التنفيذ')} — {label[:60]}")
+    for item in queued[:10]:
+        lines.append(f"• {item['id']} — انتظار — {item.get('url', 'ملف')[:70]}")
+    for item in waiting[:10]:
+        lines.append(f"• بانتظار اختيار الجودة — {item.get('url', 'رابط')[:70]}")
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_status(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    try:
+        usage = shutil.disk_usage("/content")
+        disk = f"{human_size(usage.free)} متاحة من {human_size(usage.total)}"
+    except OSError:
+        disk = "غير متاحة"
+    await update.message.reply_text(
+        "🧠 *حالة DriveSaverBot*\n\n"
+        f"🔄 عمليات نشطة: {len(active_tasks)}\n"
+        f"💽 مساحة Colab: {disk}\n"
+        f"📦 حجم جزء رفع Drive: {human_size(DRIVE_UPLOAD_CHUNK_BYTES)}\n"
+        "☁️ بيئة التشغيل: Google Colab",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_colab(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    url = "https://colab.research.google.com/github/Hus-GPT/drive-saver-bot/blob/main/colab/DriveSaverBot_Colab.ipynb"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📒 فتح دفتر Google Colab", url=url)]])
+    await update.message.reply_text(
+        "افتح الدفتر لتشغيل Colab. إذا كانت الجلسة متوقفة، شغّل خلية التشغيل يدويًا.",
+        reply_markup=keyboard,
+    )
 
 async def cmd_id(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     await update.message.reply_text(f"🆔 `{update.effective_chat.id}`", parse_mode="Markdown")
 
 
 async def cmd_stats(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
     uid = update.effective_user.id
     pending = sum(1 for p in pending_downloads.values() if p["user_id"] == uid)
     await update.message.reply_text(f"📊 *إحصائياتك*\n\n👤 معرّفك: `{uid}`\n🔄 تحميلات معلقة: {pending}\n✅ المصادقة: {'نعم' if uid in authenticated_users else 'لا'}", parse_mode="Markdown")
 
 
 async def cmd_cancel(update, context):
-    cancel_flags[update.effective_user.id] = True
-    await update.message.reply_text("🛑 جارٍ الإلغاء...")
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    target = context.args[0] if context.args else None
+    pool = {**queued_tasks, **active_tasks}
+    matches = [
+        task_id for task_id, task in pool.items()
+        if task.get("user_id") == OWNER_ID and (target is None or task_id == target)
+    ]
+    if target and not matches:
+        await update.message.reply_text("لم أجد مهمة بهذا الرقم. استخدم /queue لعرض أرقام المهام.")
+        return
+    if not matches:
+        await update.message.reply_text("لا توجد عمليات لإلغائها.")
+        return
+    for task_id in matches:
+        cancel_flags[task_id] = True
+    await update.message.reply_text("🛑 طُلب إلغاء: " + ", ".join(matches))
 
 
 async def handle_message(update, context):
-    uid = update.effective_user.id
-    if uid not in authenticated_users:
-        text = (update.message.text or "").strip()
-        if text == BOT_PASSWORD:
-            authenticated_users.add(uid)
-            await update.message.reply_text("✅ تم التحقق!\n\nأرسل أي رابط أو ملف.\nاستخدم /help للمساعدة.")
-        else:
-            await update.message.reply_text("❌ كلمة سر خاطئة.")
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    if update.message.document or update.message.video or update.message.audio:
-        await handle_telegram_file(update, context, update.message.document or update.message.video or update.message.audio)
+    uid = update.effective_user.id
+    authenticated_users.add(uid)
+    message = update.message
+    file_obj = (
+        message.document or message.video or message.audio or message.animation
+        or message.voice or message.video_note or (message.photo[-1] if message.photo else None)
+    )
+    if file_obj:
+        await handle_telegram_file(update, context, file_obj)
         return
     text = (update.message.text or "").strip()
     if text.startswith(("http://", "https://")):
@@ -333,15 +539,22 @@ async def handle_link(update, context, url):
 
 async def handle_callback(update, context):
     q = update.callback_query
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        await q.answer("غير مصرح لك باستخدام هذا البوت.", show_alert=True)
+        return
     await q.answer()
     data = q.data
     uid = update.effective_user.id
     if data.startswith("cancel|"):
         sid = data.split("|", 1)[1]
         p = pending_downloads.pop(sid, None)
-        if p:
-            cancel_flags[p["user_id"]] = True
-        await q.edit_message_text("❌ تم الإلغاء.")
+        if p and p.get("user_id") == uid:
+            await q.edit_message_text("❌ تم إلغاء طلب التنزيل.")
+        else:
+            await q.edit_message_text("❌ انتهى الطلب أو لا تملك صلاحية إلغائه.")
+        return
+    if data.startswith("large_cancel|"):
+        await q.edit_message_text("تم إلغاء الإجراء. لم تُنشأ مهمة نقل.")
         return
     if data.startswith("dl|"):
         _, sid, quality = data.split("|", 2)
@@ -365,126 +578,358 @@ async def safe_edit(msg, text):
 
 async def do_download(update, context, msg, url, quality, info):
     uid = update.effective_user.id
-    cancel_flags[uid] = False
-    start = time.time()
-    last = {"t": 0}
+    task_id = uuid.uuid4().hex[:8]
+    started = time.time()
     loop = asyncio.get_running_loop()
+    sample = {"time": started, "bytes": 0, "last_edit": 0.0}
+    queued_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "url": url, "status": "في الانتظار",
+        "started_at": started,
+    }
+    cancel_flags[task_id] = False
+    is_video = bool(info and info.get("is_video"))
+    persist_task({
+        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "is_video": is_video, "status": "queued", "started_at": started,
+    })
+    await transfer_semaphore.acquire()
+    queued_tasks.pop(task_id, None)
+    if cancel_flags.get(task_id, False):
+        persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+        cancel_flags.pop(task_id, None)
+        transfer_semaphore.release()
+        await msg.edit_text(f"🛑 أُلغيت المهمة {task_id} قبل بدء النقل.")
+        return
+    active_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "url": url,
+        "status": "تنزيل", "started_at": started,
+    }
+    persist_task({
+        "task_id": task_id, "user_id": uid, "url": url, "quality": quality,
+        "is_video": is_video, "status": "started", "started_at": started,
+    })
 
     def cancelled():
-        return cancel_flags.get(uid, False)
+        return cancel_flags.get(task_id, False)
 
-    def cb(prefix):
-        def f(d):
-            now = time.time()
-            if now - last["t"] < PROGRESS_UPDATE_INTERVAL:
-                return
-            last["t"] = now
-            done = d.get("downloaded_bytes", 0)
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            speed = d.get("speed") or 0
-            if total:
-                pct = done / total * 100
-                filled = min(20, int(pct / 5))
-                bar = "█" * filled + "░" * (20 - filled)
-                text = f"{prefix}\n\n`[{bar}]` {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
-            else:
-                text = f"{prefix}\n\n💾 {human_size(done)}"
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
-        return f
+    def download_progress(data):
+        now = time.time()
+        done = int(data.get("downloaded_bytes") or 0)
+        total = int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0)
+        elapsed = max(now - sample["time"], 0.001)
+        speed = data.get("speed") or max(0, done - sample["bytes"]) / elapsed
+        sample.update({"time": now, "bytes": done})
+        active_tasks[task_id].update({
+            "status": "تنزيل", "download_bytes": done,
+            "download_total": total, "download_speed": speed,
+        })
+        if now - sample["last_edit"] < PROGRESS_UPDATE_INTERVAL:
+            return
+        sample["last_edit"] = now
+        if total:
+            pct = min(100, done / total * 100)
+            filled = min(20, int(pct / 5))
+            bar = "█" * filled + "░" * (20 - filled)
+            text = f"⬇️ *تنزيل الملف*\n\nالمهمة: {task_id}\n[{bar}] {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
+        else:
+            text = f"⬇️ *تنزيل الملف*\n\nالمهمة: {task_id}\n💾 {human_size(done)}\n⚡ {human_size(speed)}/s"
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            progress = cb("⬇️ التحميل")
+        with tempfile.TemporaryDirectory(prefix="drive-saver-") as tmp:
             try:
                 if is_youtube_url(url):
                     await youtube_gate()
                 if info and info.get("is_video"):
-                    file_path = await asyncio.to_thread(download_video, url, tmp, quality or "720", progress, cancelled)
+                    file_path = await asyncio.to_thread(
+                        download_video, url, tmp, quality or "720", download_progress, cancelled
+                    )
                 else:
-                    file_path = await asyncio.to_thread(download_direct, url, tmp, progress, cancelled)
-            except Exception as e:
-                if "__CANCELLED__" in str(e):
-                    await msg.edit_text("🛑 تم الإلغاء.")
+                    file_path = await asyncio.to_thread(
+                        download_direct, url, tmp, download_progress, cancelled
+                    )
+            except Exception as exc:
+                if "__CANCELLED__" in str(exc):
+                    await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
                     return
-                if info and info.get("is_video"):
-                    if is_rate_limit_error(e) and is_youtube_url(url):
-                        await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429).\n\nلن نكرر الطلبات بسرعة. جرّب لاحقاً.")
-                        return
-                    raise
-                logger.warning(f"direct download failed: {e}")
+                if info and info.get("is_video") and is_rate_limit_error(exc) and is_youtube_url(url):
+                    await msg.edit_text("⚠️ YouTube قيّد الطلبات من خادم البوت (429). جرّب لاحقًا.")
+                    persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:400]})
+                    return
                 raise
-            if not file_path or not os.path.exists(file_path):
-                raise Exception("لم يتم إنشاء أي ملف")
+
+            if cancelled():
+                await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+                return
+            if not file_path or not os.path.isfile(file_path):
+                raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
             size = os.path.getsize(file_path)
-            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\n💾 {human_size(size)}")
-            result = await asyncio.to_thread(upload_to_drive, file_path)
-            elapsed = time.time() - start
-            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\n\n📁 [{result['name']}]({result['link']})\n💾 الحجم: {human_size(size)}\n⏱️ الوقت: {human_time(elapsed)}\n⚡ متوسط السرعة: {human_size(size / elapsed if elapsed else 0)}/s", parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ فشل:\n`{str(e)[:300]}`", parse_mode="Markdown")
+            active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
+            upload_started = time.time()
+            upload_sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
+
+            def upload_progress(done, total):
+                now = time.time()
+                speed = max(0, done - upload_sample["bytes"]) / max(now - upload_sample["time"], 0.001)
+                upload_sample.update({"time": now, "bytes": done})
+                active_tasks[task_id].update({
+                    "status": "رفع إلى Drive", "upload_bytes": done,
+                    "upload_total": total, "upload_speed": speed,
+                })
+                if now - upload_sample["last_edit"] < PROGRESS_UPDATE_INTERVAL and done < total:
+                    return
+                upload_sample["last_edit"] = now
+                pct = done / total * 100 if total else 0
+                text = f"📤 *رفع إلى Google Drive*\n\nالمهمة: {task_id}\nالتقدم: {pct:.1f}% — {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s\n⏱️ {human_time(now - upload_started)}"
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+
+            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\n💾 {human_size(size)}\nالمهمة: {task_id}")
+            result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress, cancelled)
+            elapsed = time.time() - started
+            persist_task({
+                "task_id": task_id, "user_id": uid, "url": url,
+                "name": result["name"], "size": size, "status": "completed",
+                "drive_file_id": result["id"], "drive_link": result["link"],
+                "elapsed_seconds": round(elapsed, 2),
+                "average_bytes_per_second": round(size / elapsed, 2) if elapsed else 0,
+            })
+            if result.get("already_exists"):
+                success_prefix = "♻️ *الملف موجود مسبقًا في Drive؛ لم أرفع نسخة مكررة.*"
+            else:
+                success_prefix = "✅ *تم الحفظ والتحقق في Drive!*"
+            await msg.edit_text(
+                f"{success_prefix}\n\n📁 [{result['name']}]({result['link']})"
+                f"\n💾 الحجم: {human_size(size)}\n⏱️ الوقت الكلي: {human_time(elapsed)}"
+                f"\n⚡ متوسط السرعة الكلية: {human_size(size / elapsed if elapsed else 0)}/s"
+                f"\n🆔 المهمة: {task_id}",
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        if "__CANCELLED__" in str(exc) or cancelled():
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "cancelled"})
+            try:
+                await msg.edit_text(f"🛑 أُلغيت المهمة {task_id}.")
+            except Exception:
+                pass
+        else:
+            logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
+            persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
+            try:
+                await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
+            except Exception:
+                pass
     finally:
-        cancel_flags.pop(uid, None)
+        cancel_flags.pop(task_id, None)
+        queued_tasks.pop(task_id, None)
+        active_tasks.pop(task_id, None)
+        transfer_semaphore.release()
 
 
 async def handle_telegram_file(update, context, file_obj):
     file_size = getattr(file_obj, "file_size", None) or 0
     if file_size > MAX_TELEGRAM_DOWNLOAD_BYTES:
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 تحويل الملف إلى رابط", url="https://t.me/File2url_rbot")]
-        ])
+        sid = uuid.uuid4().hex[:8]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 إرسال / فتح بوت التحويل", url="https://t.me/File2url_rbot"),
+            InlineKeyboardButton("❌ إلغاء", callback_data=f"large_cancel|{sid}"),
+        ]])
         await update.message.reply_text(
-            "📦 *الملف كبير جدًا*\n\n"
+            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\n\n"
             f"💾 الحجم: {human_size(file_size)}\n"
-            "⚠️ Telegram لا يسمح للبوت بتنزيل الملفات الأكبر من 20MB مباشرة.\n\n"
-            "حوّل الملف إلى رابط عبر الزر أدناه، ثم أرسل الرابط إلى DriveSaverBot وسأحفظه في Google Drive.",
+            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\n\n"
+            "هل تريد المتابعة؟",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
         return
 
-    msg = await update.message.reply_text("📥 جارٍ التنزيل من تلجرام...")
-    start = time.time()
+    uid = update.effective_user.id
+    task_id = uuid.uuid4().hex[:8]
+    started = time.time()
+    queued_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "status": "في الانتظار",
+        "name": getattr(file_obj, "file_name", None), "started_at": started,
+    }
+    cancel_flags[task_id] = False
+    persist_task({
+        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "file_name": getattr(file_obj, "file_name", None),
+        "file_unique_id": getattr(file_obj, "file_unique_id", None),
+        "status": "queued", "started_at": started,
+    })
+    await transfer_semaphore.acquire()
+    queued_tasks.pop(task_id, None)
+    if cancel_flags.get(task_id, False):
+        persist_task({"task_id": task_id, "user_id": uid, "file_id": file_obj.file_id, "status": "cancelled"})
+        cancel_flags.pop(task_id, None)
+        transfer_semaphore.release()
+        await update.message.reply_text("🛑 أُلغيت المهمة قبل بدء النقل.")
+        return
+    active_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
+        "name": getattr(file_obj, "file_name", None), "started_at": started,
+    }
+    persist_task({
+        "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+        "file_name": getattr(file_obj, "file_name", None),
+        "file_unique_id": getattr(file_obj, "file_unique_id", None),
+        "status": "telegram_download_started", "started_at": started,
+    })
+    msg = None
     try:
+        msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\nالمهمة: {task_id}")
         tg = await context.bot.get_file(file_obj.file_id)
-        name = file_obj.file_name or f"tg_{file_obj.file_unique_id}"
-        with tempfile.TemporaryDirectory() as tmp:
+        raw_name = getattr(file_obj, "file_name", None) or f"telegram_{getattr(file_obj, 'file_unique_id', task_id)}"
+        name = Path(raw_name).name
+        name = "".join(ch for ch in name if ch.isalnum() or ch in "._- ()")[:180] or f"telegram_{task_id}"
+        with tempfile.TemporaryDirectory(prefix="drive-saver-telegram-") as tmp:
             path = os.path.join(tmp, name)
             await tg.download_to_drive(path)
             size = os.path.getsize(path)
-            await msg.edit_text(f"📤 جارٍ الرفع... ({human_size(size)})")
-            result = await asyncio.to_thread(upload_to_drive, path)
-            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\n\n📁 [{result['name']}]({result['link']})\n💾 {human_size(size)}\n⏱️ {human_time(time.time() - start)}", parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ فشل:\n`{str(e)[:300]}`", parse_mode="Markdown")
+            active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
+            persist_task({
+                "task_id": task_id, "user_id": uid, "file_id": file_obj.file_id,
+                "file_name": name, "file_unique_id": getattr(file_obj, "file_unique_id", None),
+                "size": size, "status": "uploading_telegram",
+            })
+            upload_started = time.time()
+            sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
+            loop = asyncio.get_running_loop()
+
+            def upload_progress(done, total):
+                now = time.time()
+                speed = max(0, done - sample["bytes"]) / max(now - sample["time"], 0.001)
+                sample.update({"time": now, "bytes": done})
+                pct = done / total * 100 if total else 0
+                active_tasks[task_id].update({"upload_bytes": done, "upload_total": total, "upload_speed": speed})
+                if now - sample["last_edit"] < PROGRESS_UPDATE_INTERVAL and done < total:
+                    return
+                sample["last_edit"] = now
+                text = f"📤 رفع إلى Drive: {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+
+            result = await asyncio.to_thread(upload_to_drive, path, upload_progress, lambda: cancel_flags.get(task_id, False))
+            elapsed = time.time() - started
+            persist_task({
+                "task_id": task_id, "user_id": uid, "name": result["name"], "size": size,
+                "status": "completed", "drive_file_id": result["id"], "drive_link": result["link"],
+                "elapsed_seconds": round(elapsed, 2),
+            })
+            await msg.edit_text(
+                f"✅ *تم الحفظ والتحقق في Drive!*\n\n📁 [{result['name']}]({result['link']})"
+                f"\n💾 {human_size(size)}\n⏱️ {human_time(elapsed)}\n🆔 المهمة: {task_id}",
+                parse_mode="Markdown", disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
+        persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
+        try:
+            if msg is not None:
+                await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
+            else:
+                await update.message.reply_text(f"❌ فشلت المهمة {task_id}: {str(exc)[:250]}")
+        except Exception:
+            pass
+    finally:
+        cancel_flags.pop(task_id, None)
+        queued_tasks.pop(task_id, None)
+        active_tasks.pop(task_id, None)
+        transfer_semaphore.release()
+
+def latest_task_records():
+    latest = {}
+    path = Path(TASK_LOG_PATH)
+    if not path.exists():
+        return latest
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                    task_id = item.get("task_id")
+                    if task_id:
+                        latest[task_id] = item
+                except json.JSONDecodeError:
+                    continue
+    except OSError as exc:
+        logger.warning("Could not read task journal: %s", exc)
+    return latest
 
 
-app_flask = Flask(__name__)
+async def configure_bot_menu(application):
+    commands = [
+        BotCommand("start", "بدء استخدام البوت"),
+        BotCommand("help", "المساعدة"),
+        BotCommand("queue", "العمليات الجارية والمنتظرة"),
+        BotCommand("status", "حالة البوت ومساحة Colab"),
+        BotCommand("colab", "فتح دفتر Google Colab"),
+        BotCommand("cancel", "إلغاء مهمة"),
+    ]
+    await application.bot.set_my_commands(commands)
+    # Telegram's native menu can show commands; a direct URL requires a Mini App.
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-@app_flask.get("/")
-def health():
-    return "OK", 200
+    latest = latest_task_records()
+    recoverable = [
+        item for item in latest.values()
+        if item.get("status") in {"queued", "started", "uploading", "telegram_download_started", "uploading_telegram"}
+        and (item.get("url") or item.get("file_id"))
+    ]
+    for item in recoverable:
+        old_id = item.get("task_id")
+        try:
+            if item.get("file_id"):
+                async def reply_text(text, **kwargs):
+                    return await application.bot.send_message(chat_id=OWNER_ID, text=text, **kwargs)
+                fake_message = SimpleNamespace(reply_text=reply_text)
+                fake_update = SimpleNamespace(
+                    effective_user=SimpleNamespace(id=OWNER_ID), message=fake_message
+                )
+                fake_file = SimpleNamespace(
+                    file_id=item["file_id"], file_size=0,
+                    file_name=item.get("file_name"),
+                    file_unique_id=item.get("file_unique_id", old_id),
+                )
+                asyncio.create_task(handle_telegram_file(fake_update, application, fake_file))
+            else:
+                message = await application.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text="♻️ استعادة مهمة انقطعت سابقًا.",
+                    disable_web_page_preview=True,
+                )
+                info = {"is_video": True} if item.get("is_video") else None
+                fake_update = SimpleNamespace(effective_user=SimpleNamespace(id=OWNER_ID))
+                asyncio.create_task(
+                    do_download(fake_update, application, message, item["url"], item.get("quality"), info)
+                )
+            persist_task({
+                "task_id": old_id, "user_id": OWNER_ID, "url": item.get("url"),
+                "file_id": item.get("file_id"), "status": "recovery_scheduled",
+                "recovered_as_new_task": True,
+            })
+        except Exception as exc:
+            logger.warning("Could not recover task %s: %s", old_id, exc)
 
-
-def run_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    app_flask.run(host="0.0.0.0", port=port)
 
 
 def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
-    logger.info("🌐 Health server started")
-    logger.info("🚀 Starting DriveSaverBot...")
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(4).build()
+    logger.info("🚀 Starting DriveSaverBot inside Google Colab...")
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(16).post_init(configure_bot_menu).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
