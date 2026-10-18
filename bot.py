@@ -116,8 +116,10 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
     expected_size = os.path.getsize(file_path)
     fingerprint = sha256_file(file_path)
     service = drive_service or get_drive_service()
+    # Search across the entire Drive, not only the destination root. This
+    # prevents identical content from being duplicated in nested folders too.
     query = (
-        f"'{DRIVE_FOLDER_ID}' in parents and trashed = false and "
+        "trashed = false and "
         f"appProperties has {{ key='sha256' and value='{fingerprint}' }}"
     )
     existing = service.files().list(
