@@ -153,6 +153,73 @@ class TransferTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
 
+    def test_archive_nested_folders_are_created_and_reused_in_drive(self):
+        class FolderCreateRequest:
+            def __init__(self, owner, body):
+                self.owner = owner
+                self.body = body
+
+            def execute(self, num_retries=0):
+                folder = {
+                    "id": f"folder-{len(self.owner.folders) + 1}",
+                    "name": self.body["name"],
+                    "parent": self.body["parents"][0],
+                }
+                self.owner.folders.append(folder)
+                return {"id": folder["id"], "name": folder["name"]}
+
+        class FolderFiles:
+            def __init__(self):
+                self.folders = []
+
+            def list(self, q, pageSize, fields):
+                re = __import__("re")
+                name_match = re.search(r"name = '([^']+)'", q)
+                parent_match = re.search(r"'([^']+)' in parents", q)
+                name = name_match.group(1) if name_match else None
+                parent = parent_match.group(1) if parent_match else None
+                matches = [
+                    {"id": item["id"], "name": item["name"]}
+                    for item in self.folders
+                    if item["name"] == name and item["parent"] == parent
+                ]
+                return FakeListRequest(matches)
+
+            def create(self, body, fields):
+                return FolderCreateRequest(self, body)
+
+        class FolderService:
+            def __init__(self):
+                self.resource = FolderFiles()
+
+            def files(self):
+                return self.resource
+
+        service = FolderService()
+        with patch.object(bot, "DRIVE_FOLDER_ID", "root-folder"):
+            nested_id = bot.ensure_drive_folder_path("docs/images", service=service)
+            self.assertEqual(nested_id, "folder-2")
+            self.assertEqual(
+                [(item["name"], item["parent"]) for item in service.resource.folders],
+                [("docs", "root-folder"), ("images", "folder-1")],
+            )
+            self.assertEqual(
+                bot.ensure_drive_folder_path("docs/images", service=service),
+                "folder-2",
+            )
+            self.assertEqual(len(service.resource.folders), 2)
+
+    def test_archive_member_parent_id_preserves_nested_relative_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, "bundle.zip")
+            extraction_root = os.path.join(tmp, "extracted_bundle")
+            nested_file = os.path.join(extraction_root, "docs", "images", "photo.jpg")
+            os.makedirs(os.path.dirname(nested_file))
+            with open(nested_file, "wb") as handle:
+                handle.write(b"image")
+            relative_parent = bot.archive_member_parent_id(nested_file, archive_path, tmp)
+            self.assertEqual(str(relative_parent), os.path.join("docs", "images"))
+
     def test_zip_archive_extracts_files_and_does_not_return_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = os.path.join(tmp, "bundle.zip")
