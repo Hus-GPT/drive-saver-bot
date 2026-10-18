@@ -5,6 +5,8 @@ import time
 import uuid
 import asyncio
 import threading
+import shutil
+import json
 from pathlib import Path
 from urllib.parse import urlparse
 from flask import Flask
@@ -30,10 +32,13 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
-PROGRESS_UPDATE_INTERVAL = 3
+PROGRESS_UPDATE_INTERVAL = 2
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
 MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+DRIVE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MiB, multiple of 256 KiB
+TASK_LOG_PATH = os.environ.get('TASK_LOG_PATH', '/content/drive/MyDrive/.drive_saver_bot/tasks.jsonl')
+TASK_LOG_LOCK = threading.Lock()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,9 +48,23 @@ logger = logging.getLogger(__name__)
 
 authenticated_users = set()
 pending_downloads = {}
+active_tasks = {}
 cancel_flags = {}
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
+
+
+def persist_task(record):
+    """Append task history to Drive without storing credentials or tokens."""
+    try:
+        path = Path(TASK_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(record)
+        payload.setdefault("recorded_at", time.time())
+        with TASK_LOG_LOCK, path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("Could not persist task history: %s", exc)
 
 
 def get_drive_service():
@@ -71,15 +90,42 @@ def get_drive_service():
 drive_service = get_drive_service()
 
 
-def upload_to_drive(file_path):
+def upload_to_drive(file_path, progress_cb=None):
+    """Resumable upload with an explicit chunk size and server-side size verification."""
+    expected_size = os.path.getsize(file_path)
     metadata = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
-    media = MediaFileUpload(file_path, resumable=True)
-    file = (
-        drive_service.files()
-        .create(body=metadata, media_body=media, fields="id, webViewLink, name, size")
-        .execute()
+    media = MediaFileUpload(
+        file_path,
+        resumable=True,
+        chunksize=DRIVE_UPLOAD_CHUNK_BYTES,
     )
-    return {"id": file.get("id"), "link": file.get("webViewLink"), "name": file.get("name"), "size": file.get("size")}
+    request = drive_service.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink, name, size",
+    )
+    response = None
+    while response is None:
+        status, response = request.next_chunk(num_retries=3)
+        if status and progress_cb:
+            progress_cb(min(expected_size, int(status.progress() * expected_size)), expected_size)
+    if not response or not response.get("id"):
+        raise RuntimeError("Google Drive لم يُرجع معرّف الملف بعد الرفع.")
+    verified = drive_service.files().get(
+        fileId=response["id"],
+        fields="id, webViewLink, name, size",
+    ).execute(num_retries=3)
+    actual_size = int(verified.get("size", -1))
+    if actual_size != expected_size:
+        raise RuntimeError(
+            f"فشل التحقق من الملف في Drive: المتوقع {expected_size} بايت، الموجود {actual_size} بايت."
+        )
+    return {
+        "id": verified.get("id"),
+        "link": verified.get("webViewLink") or response.get("webViewLink"),
+        "name": verified.get("name") or Path(file_path).name,
+        "size": actual_size,
+    }
 
 
 def human_size(n):
@@ -211,6 +257,10 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         "progress_hooks": [hook],
         "postprocessors": pps,
         "merge_output_format": "mp4",
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "4")),
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
     })
     if ext:
         opts["final_ext"] = ext
@@ -492,7 +542,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL & filters.User(user_id=OWNER_ID) & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
