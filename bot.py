@@ -622,31 +622,71 @@ async def handle_telegram_file(update, context, file_obj):
             InlineKeyboardButton("❌ إلغاء", callback_data=f"large_cancel|{sid}"),
         ]])
         await update.message.reply_text(
-            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\n\n"
-            f"💾 الحجم: {human_size(file_size)}\n"
-            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\n\n"
+            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\\n\\n"
+            f"💾 الحجم: {human_size(file_size)}\\n"
+            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\\n\\n"
             "هل تريد المتابعة؟",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
         return
 
-    msg = await update.message.reply_text("📥 جارٍ التنزيل من تلجرام...")
-    start = time.time()
+    uid = update.effective_user.id
+    task_id = uuid.uuid4().hex[:8]
+    started = time.time()
+    active_tasks[task_id] = {
+        "id": task_id, "user_id": uid, "status": "تنزيل من Telegram",
+        "name": getattr(file_obj, "file_name", None), "started_at": started,
+    }
+    persist_task({"task_id": task_id, "user_id": uid, "status": "telegram_download_started", "started_at": started})
+    msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\\nالمهمة: {task_id}")
     try:
         tg = await context.bot.get_file(file_obj.file_id)
-        name = file_obj.file_name or f"tg_{file_obj.file_unique_id}"
-        with tempfile.TemporaryDirectory() as tmp:
+        raw_name = getattr(file_obj, "file_name", None) or f"telegram_{getattr(file_obj, 'file_unique_id', task_id)}"
+        name = Path(raw_name).name
+        name = "".join(ch for ch in name if ch.isalnum() or ch in "._- ()")[:180] or f"telegram_{task_id}"
+        with tempfile.TemporaryDirectory(prefix="drive-saver-telegram-") as tmp:
             path = os.path.join(tmp, name)
             await tg.download_to_drive(path)
             size = os.path.getsize(path)
-            await msg.edit_text(f"📤 جارٍ الرفع... ({human_size(size)})")
-            result = await asyncio.to_thread(upload_to_drive, path)
-            await msg.edit_text(f"✅ *تم الحفظ في Drive!*\n\n📁 [{result['name']}]({result['link']})\n💾 {human_size(size)}\n⏱️ {human_time(time.time() - start)}", parse_mode="Markdown", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ فشل:\n`{str(e)[:300]}`", parse_mode="Markdown")
+            active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
+            upload_started = time.time()
+            sample = {"time": upload_started, "bytes": 0, "last_edit": 0.0}
+            loop = asyncio.get_running_loop()
 
+            def upload_progress(done, total):
+                now = time.time()
+                speed = max(0, done - sample["bytes"]) / max(now - sample["time"], 0.001)
+                sample.update({"time": now, "bytes": done})
+                pct = done / total * 100 if total else 0
+                active_tasks[task_id].update({"upload_bytes": done, "upload_total": total, "upload_speed": speed})
+                if now - sample["last_edit"] < PROGRESS_UPDATE_INTERVAL and done < total:
+                    return
+                sample["last_edit"] = now
+                text = f"📤 رفع إلى Drive: {pct:.1f}%\\n💾 {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s"
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
+
+            result = await asyncio.to_thread(upload_to_drive, path, upload_progress)
+            elapsed = time.time() - started
+            persist_task({
+                "task_id": task_id, "user_id": uid, "name": result["name"], "size": size,
+                "status": "completed", "drive_file_id": result["id"], "drive_link": result["link"],
+                "elapsed_seconds": round(elapsed, 2),
+            })
+            await msg.edit_text(
+                f"✅ *تم الحفظ والتحقق في Drive!*\\n\\n📁 [{result['name']}]({result['link']})"
+                f"\\n💾 {human_size(size)}\\n⏱️ {human_time(elapsed)}\\n🆔 المهمة: {task_id}",
+                parse_mode="Markdown", disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
+        persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
+        try:
+            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\\n{str(exc)[:300]}")
+        except Exception:
+            pass
+    finally:
+        active_tasks.pop(task_id, None)
 
 app_flask = Flask(__name__)
 
