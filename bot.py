@@ -626,6 +626,19 @@ def is_youtube_bot_challenge(exc):
     )
 
 
+def is_youtube_playlist_url(url):
+    """Recognize explicit YouTube playlist URLs without classifying every YouTube video as a playlist."""
+    if not is_youtube_url(url):
+        return False
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    return bool(query.get("list")) and (
+        parsed.path.rstrip("/") == "/playlist"
+        or parsed.path.rstrip("/") == "/watch"
+        or parsed.path.startswith("/shorts/")
+    )
+
+
 def fetch_url_info(url):
     if is_google_drive_url(url):
         return {"is_video": False, "url": url, "google_drive": True}
@@ -634,8 +647,32 @@ def fetch_url_info(url):
     if is_likely_direct_file_url(url) and not is_video_platform_url(url):
         return {"is_video": False, "url": url, "direct_file": True}
     try:
-        with yt_dlp.YoutubeDL(ytdlp_opts({"skip_download": True})) as ydl:
+        is_playlist = is_youtube_playlist_url(url)
+        with yt_dlp.YoutubeDL(ytdlp_opts({"skip_download": True, "noplaylist": not is_playlist})) as ydl:
             i = ydl.extract_info(url, download=False)
+            if is_playlist:
+                entries = [entry for entry in (i.get("entries") or []) if entry]
+                first = entries[0] if entries else {}
+                formats = first.get("formats", []) or []
+                if not formats and first.get("webpage_url"):
+                    try:
+                        with yt_dlp.YoutubeDL(ytdlp_opts({"skip_download": True, "noplaylist": True})) as video_ydl:
+                            first = video_ydl.extract_info(first["webpage_url"], download=False) or first
+                            formats = first.get("formats", []) or []
+                    except Exception as exc:
+                        logger.info("Could not inspect first playlist item formats: %s", exc)
+                return {
+                    "title": i.get("title", "YouTube playlist"),
+                    "duration": first.get("duration"),
+                    "uploader": i.get("uploader") or i.get("channel") or first.get("uploader"),
+                    "thumbnail": first.get("thumbnail"),
+                    "formats": formats,
+                    "webpage_url": i.get("webpage_url", url),
+                    "is_video": True,
+                    "is_playlist": True,
+                    "playlist_count": i.get("playlist_count") or len(entries),
+                    "extractor": i.get("extractor_key", ""),
+                }
             formats = i.get("formats", []) or []
             has_video = any(f.get("vcodec") not in (None, "none") for f in formats)
             return {
@@ -668,6 +705,10 @@ def build_quality_keyboard(short_id, formats):
         "144": "144p", "360": "360p", "480": "480p", "720": "720p",
         "1080": "1080p", "1440": "2K", "2160": "4K", "2880": "5K", "4320": "8K",
     }
+    # If metadata lookup failed, still require an explicit user choice. These are
+    # quality ceilings, not a promise that the source contains that exact format.
+    if not available:
+        available.update({"360", "480", "720", "1080"})
     buttons = [[InlineKeyboardButton("🏆 أعلى جودة متاحة", callback_data=f"dl|{short_id}|best")]]
     row = []
     for q in order:
@@ -724,6 +765,57 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         if ext:
             path = os.path.splitext(path)[0] + "." + ext
         return path
+
+
+def download_youtube_playlist(url, out_dir, quality, progress_cb=None, cancel_check=None):
+    """Download a YouTube playlist sequentially; return completed media paths in playlist order."""
+    if quality == "mp3":
+        fmt = "bestaudio/best"
+        postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        extension = ".mp3"
+    elif str(quality).lower() in {"best", "best_available", "max"}:
+        fmt = "bestvideo+bestaudio/best"
+        postprocessors = []
+        extension = None
+    else:
+        fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        postprocessors = []
+        extension = None
+
+    def hook(data):
+        if cancel_check and cancel_check():
+            raise Exception("__CANCELLED__")
+        if progress_cb:
+            progress_cb(data)
+
+    opts = ytdlp_opts({
+        "noplaylist": False,
+        "ignoreerrors": True,
+        "outtmpl": os.path.join(out_dir, "%(playlist_index)03d - %(title).150s.%(ext)s"),
+        "format": fmt,
+        "progress_hooks": [hook],
+        "postprocessors": postprocessors,
+        "merge_output_format": "mp4",
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "8")),
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
+    })
+    if extension:
+        opts["final_ext"] = extension
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        result = ydl.extract_info(url, download=True)
+    if not result:
+        raise RuntimeError("لم يتمكن yt-dlp من تنزيل أي عنصر من قائمة التشغيل.")
+    paths = []
+    for entry in os.scandir(out_dir):
+        if entry.is_file() and not entry.name.endswith((".part", ".ytdl", ".json", ".description", ".jpg", ".jpeg", ".png", ".webp", ".vtt", ".srt")):
+            paths.append(entry.path)
+    paths.sort(key=lambda path: (Path(path).name.casefold()))
+    if not paths:
+        raise RuntimeError("لم ينتج تنزيل قائمة التشغيل أي ملفات مكتملة؛ قد تكون العناصر خاصة أو غير متاحة.")
+    return paths
 
 
 def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel_check=None):
@@ -1408,7 +1500,14 @@ async def handle_link(update, context, url):
         return
     sid = uuid.uuid4().hex[:10]
     pending_downloads[sid] = {"url": url, "info": info, "user_id": update.effective_user.id, "chat_id": update.effective_chat.id, "message_id": msg.message_id, "created_at": time.time()}
-    await msg.edit_text(f"🎬 *{info['title'][:80]}*\n\n👤 {info.get('uploader') or '?'}\n⏱️ المدة: {human_time(info['duration']) if info.get('duration') else '?'}\n\nاختر الجودة:", parse_mode="Markdown", reply_markup=build_quality_keyboard(sid, info.get("formats", [])))
+    if info.get("is_playlist"):
+        count = info.get("playlist_count")
+        item_count = f"\n📚 عدد العناصر: {count}" if count else ""
+        heading = f"📺 *قائمة تشغيل: {info['title'][:65]}*"
+    else:
+        item_count = ""
+        heading = f"🎬 *{info['title'][:80]}*"
+    await msg.edit_text(f"{heading}{item_count}\n\n👤 {info.get('uploader') or '?'}\n\nاختر جودة التنزيل:", parse_mode="Markdown", reply_markup=build_quality_keyboard(sid, info.get("formats", [])))
 
 
 async def handle_callback(update, context):
@@ -1567,6 +1666,73 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                             disable_web_page_preview=True)
                         return
                     file_path = drive_items[0][0]
+                elif info and info.get("is_playlist"):
+                    playlist_paths = await asyncio.to_thread(
+                        download_youtube_playlist, url, tmp, quality or "720", download_progress, cancelled
+                    )
+                    results = []
+                    failures = []
+                    total_items = len(playlist_paths)
+                    for index, playlist_path in enumerate(playlist_paths, 1):
+                        if cancelled():
+                            raise RuntimeError("__CANCELLED__")
+                        item_name = Path(playlist_path).name
+                        active_tasks[task_id].update({
+                            "status": "رفع عناصر قائمة التشغيل",
+                            "name": item_name,
+                            "playlist_index": index,
+                            "playlist_total": total_items,
+                            "size": os.path.getsize(playlist_path),
+                        })
+                        try:
+                            uploaded = await asyncio.to_thread(upload_to_drive, playlist_path, None, cancelled)
+                            results.append(uploaded)
+                            persist_task({
+                                "task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                                "user_id": uid, "url": url, "playlist_item": item_name,
+                                "playlist_index": index, "playlist_total": total_items,
+                                "name": uploaded["name"], "size": uploaded["size"],
+                                "drive_file_id": uploaded["id"], "drive_link": uploaded["link"],
+                                "status": "playlist_item_completed",
+                                "already_exists": uploaded.get("already_exists", False),
+                            })
+                        except Exception as item_exc:
+                            if "__CANCELLED__" in str(item_exc):
+                                raise
+                            failures.append((item_name, str(item_exc)[:180]))
+                            persist_task({
+                                "task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                                "user_id": uid, "url": url, "playlist_item": item_name,
+                                "playlist_index": index, "status": "playlist_item_failed",
+                                "error": str(item_exc)[:300],
+                            })
+                    if not results:
+                        raise RuntimeError(
+                            f"لم يُرفع أي فيديو من القائمة. عدد الملفات التي جرت محاولة رفعها: {total_items}."
+                        )
+                    completed = sum(1 for item in results if not item.get("already_exists"))
+                    duplicates = sum(1 for item in results if item.get("already_exists"))
+                    summary = (
+                        f"✅ اكتملت معالجة قائمة التشغيل.\n"
+                        f"📥 الملفات المعالجة: {total_items}\n"
+                        f"☁️ رُفعت الآن: {completed}\n"
+                        f"♻️ موجودة مسبقًا: {duplicates}\n"
+                        f"❌ فشل رفعها: {len(failures)}"
+                    )
+                    if failures:
+                        summary += "\n\nأول الأخطاء:\n" + "\n".join(
+                            f"• {name}: {error}" for name, error in failures[:5]
+                        )
+                    persist_task({
+                        "task_id": task_id, "recovery_parent_id": recovery_parent_id,
+                        "user_id": uid, "url": url,
+                        "status": "completed" if not failures else "completed_with_errors",
+                        "is_playlist": True, "downloaded_count": total_items,
+                        "uploaded_count": completed, "duplicate_count": duplicates,
+                        "failed_count": len(failures),
+                    })
+                    await msg.edit_text(summary, disable_web_page_preview=True)
+                    return
                 elif info and info.get("is_video"):
                     file_path = await asyncio.to_thread(
                         download_video, url, tmp, quality or "720", download_progress, cancelled
