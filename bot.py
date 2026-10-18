@@ -8,6 +8,7 @@ import threading
 import shutil
 import json
 import hashlib
+import re
 from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -311,20 +312,54 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
     filename = urlparse(url).path.rsplit("/", 1)[-1] or "downloaded_file"
     filename = "".join(c for c in filename if c.isalnum() or c in "._- ") or "downloaded_file"
     fp = os.path.join(out_dir, filename)
-    with requests.get(url, stream=True, timeout=120, headers={"User-Agent": "Mozilla/5.0"}) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
-        done = 0
-        with open(fp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if cancel_check and cancel_check():
-                    raise Exception("__CANCELLED__")
-                if chunk:
-                    f.write(chunk)
-                    done += len(chunk)
-                    if progress_cb:
-                        progress_cb({"downloaded_bytes": done, "total_bytes": total})
-    return fp
+    base_headers = {"User-Agent": "Mozilla/5.0"}
+    attempts = 3
+
+    for attempt in range(attempts):
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+        existing = os.path.getsize(fp) if os.path.exists(fp) else 0
+        headers = dict(base_headers)
+        if existing:
+            headers["Range"] = f"bytes={existing}-"
+        try:
+            with requests.get(url, stream=True, timeout=(15, 120), headers=headers) as response:
+                if response.status_code == 416 and existing:
+                    content_range = response.headers.get("Content-Range", "")
+                    match = __import__("re").search(r"/(\d+)$", content_range)
+                    if match and int(match.group(1)) == existing:
+                        return fp
+                response.raise_for_status()
+                resume = existing > 0 and response.status_code == 206
+                if not resume:
+                    existing = 0
+                content_range = response.headers.get("Content-Range", "")
+                match = __import__("re").search(r"/(\d+)$", content_range)
+                content_length = int(response.headers.get("Content-Length", 0) or 0)
+                total = int(match.group(1)) if match else (content_length + existing if content_length else 0)
+                done = existing
+                mode = "ab" if resume else "wb"
+                with open(fp, mode) as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("__CANCELLED__")
+                        if chunk:
+                            handle.write(chunk)
+                            done += len(chunk)
+                            if progress_cb:
+                                progress_cb({"downloaded_bytes": done, "total_bytes": total})
+            if total and done != total:
+                raise IOError(f"Incomplete download: expected {total} bytes, received {done}.")
+            if done == 0:
+                raise IOError("The source returned an empty file.")
+            return fp
+        except Exception as exc:
+            if "__CANCELLED__" in str(exc) or attempt >= attempts - 1:
+                raise
+            delay = attempt + 1
+            logger.warning("Direct download attempt %s/%s failed; retrying in %ss: %s", attempt + 1, attempts, delay, exc)
+            time.sleep(delay)
+    raise RuntimeError("Direct download failed after retries.")
 
 
 async def youtube_gate():
