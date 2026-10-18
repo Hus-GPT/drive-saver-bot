@@ -232,6 +232,28 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(bot.find_duplicate_telegram_task("unique-file"), "tg123")
         self.assertIsNone(bot.find_duplicate_telegram_task(None))
 
+    def test_retry_parent_remains_recoverable_until_child_is_journaled(self):
+        parent = {
+            "task_id": "parent1", "status": "retry_scheduled",
+            "url": "https://example.com/file.bin",
+        }
+        self.assertEqual(
+            [item["task_id"] for item in bot.get_recoverable_task_records({"parent1": parent})],
+            ["parent1"],
+        )
+
+    def test_recovery_parent_is_not_replayed_after_child_is_journaled(self):
+        parent = {
+            "task_id": "parent1", "status": "recovery_scheduled",
+            "url": "https://example.com/file.bin",
+        }
+        child = {
+            "task_id": "child1", "status": "started",
+            "url": "https://example.com/file.bin", "recovery_parent_id": "parent1",
+        }
+        recoverable = bot.get_recoverable_task_records({"parent1": parent, "child1": child})
+        self.assertEqual([item["task_id"] for item in recoverable], ["child1"])
+
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "tasks.jsonl")
