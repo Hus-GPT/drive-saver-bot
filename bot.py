@@ -1266,7 +1266,7 @@ async def handle_link(update, context, url):
     if not info.get("is_video"):
         if info.get("rate_limited") and info.get("youtube"):
             await msg.edit_text("⚠️ YouTube يقيّد مؤقتاً طلبات خادم البوت (429).\n\nلن نحاول تنزيل الرابط كأنه ملف مباشر، لأن ذلك لن يحل المشكلة. جرّب بعد فترة قصيرة.")
-        return
+            return
         if info.get("error") and is_video_platform_url(url):
             # Metadata extraction can fail temporarily while the platform's direct
             # media extractor still works. Never send a failed social-video URL
