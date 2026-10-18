@@ -101,7 +101,7 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result["id"], "drive-id-1")
             self.assertEqual(result["size"], 10)
             self.assertEqual(progress, [(10, 10)])
-            self.assertEqual(media_factory.call_args.kwargs["chunksize"], 8 * 1024 * 1024)
+            self.assertEqual(media_factory.call_args.kwargs["chunksize"], 32 * 1024 * 1024)
             self.assertTrue(media_factory.call_args.kwargs["resumable"])
 
     def test_existing_identical_file_is_not_uploaded_twice(self):
@@ -152,6 +152,35 @@ class TransferTests(unittest.TestCase):
             ), patch.object(bot, "MediaFileUpload", return_value=object()):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
+
+    def test_zip_archive_extracts_files_and_does_not_return_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, "bundle.zip")
+            with __import__("zipfile").ZipFile(archive_path, "w") as archive:
+                archive.writestr("docs/readme.txt", "hello")
+                archive.writestr("images/picture.txt", "image")
+            extracted = bot.extract_archive_contents(archive_path, tmp)
+            self.assertEqual(len(extracted), 2)
+            self.assertTrue(all(os.path.isfile(path) for path in extracted))
+            self.assertNotIn(archive_path, extracted)
+            self.assertEqual(open(extracted[0], encoding="utf-8").read(), "hello")
+
+    def test_zip_archive_rejects_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, "unsafe.zip")
+            with __import__("zipfile").ZipFile(archive_path, "w") as archive:
+                archive.writestr("../outside.txt", "unsafe")
+            with self.assertRaisesRegex(RuntimeError, "غير آمن"):
+                bot.extract_archive_contents(archive_path, tmp)
+
+    def test_progress_format_shows_percent_and_speed(self):
+        text = bot.format_task_progress({
+            "id": "abc123", "name": "video.mp4", "status": "تنزيل",
+            "download_bytes": 50, "download_total": 100, "download_speed": 10,
+        })
+        self.assertIn("abc123", text)
+        self.assertIn("50.0%", text)
+        self.assertIn("السرعة", text)
 
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:

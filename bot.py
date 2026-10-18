@@ -9,6 +9,8 @@ import shutil
 import json
 import hashlib
 import re
+import zipfile
+import posixpath
 from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse, urlunsplit
@@ -27,6 +29,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import yt_dlp
 import requests
+import rarfile
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
@@ -34,11 +37,11 @@ DRIVE_FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
-PROGRESS_UPDATE_INTERVAL = 2
+PROGRESS_UPDATE_INTERVAL = 1
 YOUTUBE_MIN_INTERVAL = 8
 YOUTUBE_RETRIES = 2
 MAX_TELEGRAM_DOWNLOAD_BYTES = 20 * 1024 * 1024
-DRIVE_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # 8 MiB, multiple of 256 KiB
+DRIVE_UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024  # 32 MiB, multiple of 256 KiB
 TASK_LOG_PATH = os.environ.get('TASK_LOG_PATH', '/content/drive/MyDrive/.drive_saver_bot/tasks.jsonl')
 TASK_LOG_LOCK = threading.Lock()
 
@@ -52,7 +55,7 @@ authenticated_users = set()
 pending_downloads = {}
 queued_tasks = {}
 active_tasks = {}
-transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '2'))))
+transfer_semaphore = asyncio.Semaphore(max(1, int(os.environ.get('MAX_CONCURRENT_TRANSFERS', '8'))))
 cancel_flags = {}
 youtube_lock = asyncio.Lock()
 youtube_last_request = 0.0
@@ -109,6 +112,85 @@ def sha256_file(file_path):
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+
+ARCHIVE_EXTENSIONS = {".zip", ".rar"}
+MAX_ARCHIVE_MEMBERS = 5000
+MAX_ARCHIVE_EXPANDED_BYTES = 50 * 1024 * 1024 * 1024
+
+
+def _safe_archive_target(root, member_name):
+    """Resolve an archive member without permitting absolute paths or traversal."""
+    normalized = member_name.replace("\\", "/")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise RuntimeError(f"رفض مسار مطلق داخل الأرشيف: {member_name[:120]}")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise RuntimeError(f"رفض مسار غير آمن داخل الأرشيف: {member_name[:120]}")
+    target = (Path(root) / Path(*parts)).resolve()
+    base = Path(root).resolve()
+    if target != base and base not in target.parents:
+        raise RuntimeError(f"رفض مسار خارج مجلد الاستخراج: {member_name[:120]}")
+    return target
+
+
+def extract_archive_contents(file_path, work_dir):
+    """Extract ZIP/RAR safely; return extracted files, or None for non-archives."""
+    source = Path(file_path)
+    suffix = source.suffix.lower()
+    if suffix not in ARCHIVE_EXTENSIONS:
+        return None
+
+    extract_root = Path(work_dir) / ("extracted_" + re.sub(r"[^A-Za-z0-9_-]", "_", source.stem)[:80])
+    extract_root.mkdir(parents=True, exist_ok=True)
+    members = []
+    expanded_bytes = 0
+
+    if suffix == ".zip":
+        with zipfile.ZipFile(source) as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_ARCHIVE_MEMBERS:
+                raise RuntimeError(f"الأرشيف يحتوي على أكثر من {MAX_ARCHIVE_MEMBERS} عنصر.")
+            for info in infos:
+                if info.is_dir():
+                    continue
+                # Reject Unix symlinks in ZIP metadata.
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    continue
+                target = _safe_archive_target(extract_root, info.filename)
+                expanded_bytes += int(info.file_size or 0)
+                if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                    raise RuntimeError("حجم الملفات بعد فك الأرشيف يتجاوز الحد الآمن 50 GiB.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info, "r") as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
+                members.append(str(target))
+    else:
+        try:
+            with rarfile.RarFile(source) as archive:
+                infos = archive.infolist()
+                if len(infos) > MAX_ARCHIVE_MEMBERS:
+                    raise RuntimeError(f"الأرشيف يحتوي على أكثر من {MAX_ARCHIVE_MEMBERS} عنصر.")
+                for info in infos:
+                    if info.is_dir():
+                        continue
+                    target = _safe_archive_target(extract_root, info.filename)
+                    expanded_bytes += int(getattr(info, "file_size", 0) or 0)
+                    if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                        raise RuntimeError("حجم الملفات بعد فك الأرشيف يتجاوز الحد الآمن 50 GiB.")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+                    members.append(str(target))
+        except rarfile.RarCannotExec as exc:
+            raise RuntimeError("تعذر فك RAR: أداة 7z غير متاحة. أعد تشغيل خلية إعداد Colab لتثبيتها.") from exc
+
+    if not members:
+        raise RuntimeError("الأرشيف لا يحتوي على ملفات قابلة للاستخراج.")
+    logger.info("Extracted %s files from archive %s", len(members), source.name)
+    return members
 
 
 def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
@@ -303,7 +385,7 @@ def download_video(url, out_dir, quality, progress_cb=None, cancel_check=None):
         "progress_hooks": [hook],
         "postprocessors": pps,
         "merge_output_format": "mp4",
-        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "4")),
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_CONCURRENT_FRAGMENTS", "8")),
         "retries": 5,
         "fragment_retries": 5,
         "socket_timeout": 30,
@@ -351,7 +433,7 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
                 done = existing
                 mode = "ab" if resume else "wb"
                 with open(fp, mode) as handle:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
                         if cancel_check and cancel_check():
                             raise RuntimeError("__CANCELLED__")
                         if chunk:
@@ -407,7 +489,7 @@ async def cmd_start(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
     await update.message.reply_text(
-        "👋 أهلاً بك في *DriveSaverBot*!\\n\\n"
+        "👋 أهلاً بك في *DriveSaverBot*!\n\n"
         "تم تقييد البوت على حساب المالك المصرّح به. أرسل رابطًا أو ملفًا للبدء، أو استخدم /help.",
         parse_mode="Markdown",
     )
@@ -421,6 +503,7 @@ async def cmd_help(update, context):
         "🔗 أرسل رابطاً → اختر الجودة عند الحاجة → يُحفظ في Drive\n"
         "📎 أرسل ملفاً → يُحفظ في Drive\n"
         "📋 /queue — العمليات الجارية والمنتظرة\n"
+        "📈 /progress — لوحة تقدم قابلة للتحديث لكل مهمة\n"
         "📊 /status — حالة البوت ومساحة Colab\n"
         "🛑 /cancel [رقم المهمة] — إلغاء مهمة محددة أو كل المهام الجارية\n"
         "📒 /colab — فتح دفتر Google Colab\n"
@@ -449,6 +532,72 @@ async def cmd_queue(update, context):
     for item in waiting[:10]:
         lines.append(f"• بانتظار اختيار الجودة — {item.get('url', 'رابط')[:70]}")
     await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
+
+
+
+def format_task_progress(task):
+    """Render one task's latest in-memory transfer progress."""
+    task_id = task.get("id") or task.get("task_id") or "?"
+    status = task.get("status", "قيد التنفيذ")
+    name = task.get("name") or task.get("url") or task.get("file_name") or "ملف"
+    phase = "تنزيل"
+    done = total = speed = 0
+    if "upload_bytes" in task or status == "رفع إلى Drive":
+        phase = "رفع إلى Drive"
+        done = int(task.get("upload_bytes") or 0)
+        total = int(task.get("upload_total") or 0)
+        speed = float(task.get("upload_speed") or 0)
+    elif "download_bytes" in task:
+        done = int(task.get("download_bytes") or 0)
+        total = int(task.get("download_total") or 0)
+        speed = float(task.get("download_speed") or 0)
+    elif "telegram_download_started" in status.lower():
+        phase = "تنزيل من Telegram"
+    if total > 0:
+        pct = max(0.0, min(100.0, done / total * 100))
+        filled = int(pct // 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        amount = f"{human_size(done)} / {human_size(total)} ({pct:.1f}%)"
+    else:
+        bar = "░" * 20
+        amount = human_size(done) if done else "جارٍ تحديد الحجم"
+    return (
+        f"🆔 المهمة: {task_id}\n"
+        f"📄 الملف: {str(name)[:100]}\n"
+        f"⚙️ المرحلة: {phase} — {status}\n"
+        f"[{bar}]\n"
+        f"💾 {amount}\n"
+        f"⚡ السرعة: {human_size(speed)}/ث"
+    )
+
+
+def build_progress_keyboard(tasks):
+    rows = []
+    for task in tasks[:12]:
+        task_id = task.get("id") or task.get("task_id")
+        if task_id:
+            name = str(task.get("name") or task.get("file_name") or task.get("url") or "ملف")
+            rows.append([InlineKeyboardButton(f"📊 {task_id} · {name[:32]}", callback_data=f"progress|{task_id}")])
+    rows.append([InlineKeyboardButton("🔄 تحديث التقدم", callback_data="progress_refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_progress(update, context):
+    if not update.effective_user or update.effective_user.id != OWNER_ID:
+        return
+    tasks = list(active_tasks.values()) + list(queued_tasks.values())
+    if not tasks:
+        await update.message.reply_text("لا توجد مهام نشطة الآن. أرسل رابطًا أو ملفًا لبدء مهمة جديدة.")
+        return
+    tasks.sort(key=lambda task: task.get("started_at", 0))
+    lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
+    lines.extend(format_task_progress(task) for task in tasks[:8])
+    await update.message.reply_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=build_progress_keyboard(tasks),
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_status(update, context):
@@ -556,6 +705,35 @@ async def handle_callback(update, context):
     await q.answer()
     data = q.data
     uid = update.effective_user.id
+    if data == "progress_refresh":
+        tasks = list(active_tasks.values()) + list(queued_tasks.values())
+        tasks.sort(key=lambda task: task.get("started_at", 0))
+        if not tasks:
+            await q.edit_message_text("📊 لا توجد مهام نشطة الآن.")
+            return
+        lines = ["📊 لوحة تقدم المهام", f"🔄 نشطة: {len(active_tasks)} | ⏳ منتظرة: {len(queued_tasks)}", ""]
+        lines.extend(format_task_progress(task) for task in tasks[:8])
+        await q.edit_message_text(
+            "\n\n".join(lines),
+            reply_markup=build_progress_keyboard(tasks),
+            disable_web_page_preview=True,
+        )
+        return
+    if data.startswith("progress|"):
+        task_id = data.split("|", 1)[1]
+        task = active_tasks.get(task_id) or queued_tasks.get(task_id)
+        if not task:
+            await q.edit_message_text("انتهت هذه المهمة أو لم تعد نشطة. أرسل /progress لعرض المهام الحالية.")
+            return
+        await q.edit_message_text(
+            format_task_progress(task),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 تحديث", callback_data=f"progress|{task_id}"),
+                InlineKeyboardButton("📋 كل المهام", callback_data="progress_refresh"),
+            ]]),
+            disable_web_page_preview=True,
+        )
+        return
     if data.startswith("cancel|"):
         sid = data.split("|", 1)[1]
         p = pending_downloads.pop(sid, None)
@@ -676,6 +854,33 @@ async def do_download(update, context, msg, url, quality, info):
                 return
             if not file_path or not os.path.isfile(file_path):
                 raise RuntimeError("لم يتم إنشاء ملف قابل للرفع.")
+            extracted_paths = await asyncio.to_thread(extract_archive_contents, file_path, tmp)
+            if extracted_paths is not None:
+                results = []
+                for extracted_path in extracted_paths:
+                    if cancelled():
+                        raise RuntimeError("__CANCELLED__")
+                    extracted_size = os.path.getsize(extracted_path)
+                    active_tasks[task_id].update({"status": "رفع محتويات الأرشيف", "name": Path(extracted_path).name, "size": extracted_size})
+                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, cancelled)
+                    results.append(result)
+                    persist_task({
+                        "task_id": task_id, "user_id": uid, "url": url,
+                        "name": result["name"], "size": extracted_size,
+                        "drive_file_id": result["id"], "drive_link": result["link"],
+                        "status": "archive_member_completed",
+                        "already_exists": result.get("already_exists", False),
+                    })
+                links = "\n".join(
+                    f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
+                    for item in results
+                )
+                persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "completed", "archive": True, "extracted_count": len(results)})
+                await msg.edit_text(
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
+                    disable_web_page_preview=True,
+                )
+                return
             size = os.path.getsize(file_path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": Path(file_path).name, "size": size})
             persist_task({"task_id": task_id, "user_id": uid, "url": url, "quality": quality, "is_video": is_video, "name": Path(file_path).name, "size": size, "status": "uploading"})
@@ -800,6 +1005,31 @@ async def handle_telegram_file(update, context, file_obj):
         with tempfile.TemporaryDirectory(prefix="drive-saver-telegram-") as tmp:
             path = os.path.join(tmp, name)
             await tg.download_to_drive(path)
+            extracted_paths = await asyncio.to_thread(extract_archive_contents, path, tmp)
+            if extracted_paths is not None:
+                results = []
+                for extracted_path in extracted_paths:
+                    if cancel_flags.get(task_id, False):
+                        raise RuntimeError("__CANCELLED__")
+                    extracted_size = os.path.getsize(extracted_path)
+                    result = await asyncio.to_thread(upload_to_drive, extracted_path, None, lambda: cancel_flags.get(task_id, False))
+                    results.append(result)
+                    persist_task({
+                        "task_id": task_id, "user_id": uid, "file_name": Path(extracted_path).name,
+                        "size": extracted_size, "drive_file_id": result["id"],
+                        "drive_link": result["link"], "status": "archive_member_completed",
+                        "already_exists": result.get("already_exists", False),
+                    })
+                links = "\n".join(
+                    f"• {item['name']} — " + ("موجود مسبقًا" if item.get("already_exists") else "تم الرفع")
+                    for item in results
+                )
+                persist_task({"task_id": task_id, "user_id": uid, "status": "completed", "archive": True, "extracted_count": len(results)})
+                await msg.edit_text(
+                    f"✅ تم استخراج الأرشيف دون رفعه، ومعالجة {len(results)} ملفًا.\n\n{links}",
+                    disable_web_page_preview=True,
+                )
+                return
             size = os.path.getsize(path)
             active_tasks[task_id].update({"status": "رفع إلى Drive", "name": name, "size": size})
             persist_task({
@@ -876,6 +1106,7 @@ async def configure_bot_menu(application):
         BotCommand("start", "بدء استخدام البوت"),
         BotCommand("help", "المساعدة"),
         BotCommand("queue", "العمليات الجارية والمنتظرة"),
+        BotCommand("progress", "لوحة تقدم المهام"),
         BotCommand("status", "حالة البوت ومساحة Colab"),
         BotCommand("colab", "فتح دفتر Google Colab"),
         BotCommand("cancel", "إلغاء مهمة"),
@@ -935,6 +1166,7 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("queue", cmd_queue))
+    app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("colab", cmd_colab))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
