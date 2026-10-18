@@ -272,6 +272,109 @@ class TransferTests(unittest.TestCase):
             self.assertTrue(record["recovery_requires_manual_url"])
             self.assertEqual(record["url_redacted"], "https://example.com/file.zip")
 
+    def test_parallel_range_download_assembles_exact_file(self):
+        data = b"abcdefghijklmnopqrstuvwxyz"
+
+        class FakeResponse:
+            def __init__(self, status_code, headers, content):
+                self.status_code = status_code
+                self.headers = headers
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def iter_content(self, chunk_size=1):
+                for offset in range(0, len(self.content), max(1, chunk_size)):
+                    yield self.content[offset:offset + chunk_size]
+
+        def fake_get(url, stream, timeout, headers):
+            value = headers.get("Range", "bytes=0-")
+            start, end = value.removeprefix("bytes=").split("-", 1)
+            start = int(start)
+            end = int(end) if end else len(data) - 1
+            if start < 0 or end >= len(data) or start > end:
+                return FakeResponse(416, {"Content-Range": f"bytes */{len(data)}"}, b"")
+            content = data[start:end + 1]
+            return FakeResponse(
+                206,
+                {
+                    "Content-Range": f"bytes {start}-{end}/{len(data)}",
+                    "Content-Length": str(len(content)),
+                },
+                content,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "DIRECT_DOWNLOAD_WORKERS": "3",
+                "DIRECT_DOWNLOAD_MIN_PARALLEL_BYTES": "1",
+                "DIRECT_DOWNLOAD_CHUNK_BYTES": "10",
+            },
+        ), patch.object(bot.requests, "get", side_effect=fake_get):
+            output = os.path.join(tmp, "sample.bin")
+            progress = []
+            result = bot.download_direct_parallel(
+                "https://example.com/sample.bin", tmp, output,
+                lambda current: progress.append(current["downloaded_bytes"]),
+            )
+            self.assertEqual(result, output)
+            with open(output, "rb") as handle:
+                self.assertEqual(handle.read(), data)
+            self.assertEqual(progress[-1], len(data))
+            self.assertTrue(all(value <= len(data) for value in progress))
+
+    def test_parallel_download_falls_back_when_server_ignores_ranges(self):
+        data = b"server-does-not-support-ranges"
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, status_code, headers, content):
+                self.status_code = status_code
+                self.headers = headers
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def iter_content(self, chunk_size=1):
+                for offset in range(0, len(self.content), max(1, chunk_size)):
+                    yield self.content[offset:offset + chunk_size]
+
+        def fake_get(url, stream, timeout, headers):
+            calls.append(headers.get("Range"))
+            return FakeResponse(200, {"Content-Length": str(len(data))}, data)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "DIRECT_DOWNLOAD_WORKERS": "3",
+                "DIRECT_DOWNLOAD_MIN_PARALLEL_BYTES": "1",
+                "DIRECT_DOWNLOAD_CHUNK_BYTES": "10",
+            },
+        ), patch.object(bot.requests, "get", side_effect=fake_get):
+            output = bot.download_direct("https://example.com/sample.bin", tmp)
+            with open(output, "rb") as handle:
+                self.assertEqual(handle.read(), data)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[0], "bytes=0-0")
+        self.assertIsNone(calls[1])
+
     def test_direct_file_url_detection_uses_path_not_query(self):
         self.assertTrue(bot.is_likely_direct_file_url("https://example.com/archive.zip?token=abc"))
         self.assertFalse(bot.is_likely_direct_file_url("https://example.com/watch?id=archive.zip"))
