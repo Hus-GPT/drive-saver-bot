@@ -153,6 +153,26 @@ class TransferTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "فشل التحقق"):
                     bot.upload_to_drive(handle.name)
 
+    def test_zip_archive_extracts_files_and_does_not_return_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, "bundle.zip")
+            with __import__("zipfile").ZipFile(archive_path, "w") as archive:
+                archive.writestr("docs/readme.txt", "hello")
+                archive.writestr("images/picture.txt", "image")
+            extracted = bot.extract_archive_contents(archive_path, tmp)
+            self.assertEqual(len(extracted), 2)
+            self.assertTrue(all(os.path.isfile(path) for path in extracted))
+            self.assertNotIn(archive_path, extracted)
+            self.assertEqual(open(extracted[0], encoding="utf-8").read(), "hello")
+
+    def test_zip_archive_rejects_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = os.path.join(tmp, "unsafe.zip")
+            with __import__("zipfile").ZipFile(archive_path, "w") as archive:
+                archive.writestr("../outside.txt", "unsafe")
+            with self.assertRaisesRegex(RuntimeError, "غير آمن"):
+                bot.extract_archive_contents(archive_path, tmp)
+
     def test_task_journal_redacts_signed_url_query(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal = os.path.join(tmp, "tasks.jsonl")
