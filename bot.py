@@ -90,7 +90,7 @@ def get_drive_service():
 drive_service = get_drive_service()
 
 
-def upload_to_drive(file_path, progress_cb=None):
+def upload_to_drive(file_path, progress_cb=None, cancel_check=None):
     """Resumable upload with an explicit chunk size and server-side size verification."""
     expected_size = os.path.getsize(file_path)
     metadata = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
@@ -106,6 +106,8 @@ def upload_to_drive(file_path, progress_cb=None):
     )
     response = None
     while response is None:
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
         status, response = request.next_chunk(num_retries=3)
         if status and progress_cb:
             progress_cb(min(expected_size, int(status.progress() * expected_size)), expected_size)
@@ -326,7 +328,11 @@ async def fetch_url_info_safe(url):
 async def cmd_start(update, context):
     if not update.effective_user or update.effective_user.id != OWNER_ID:
         return
-    await update.message.reply_text("👋 أهلاً بك في *DriveSaverBot*!\n\n🔐 أرسل كلمة السر للمتابعة.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "👋 أهلاً بك في *DriveSaverBot*!\\n\\n"
+        "تم تقييد البوت على حساب المالك المصرّح به. أرسل رابطًا أو ملفًا للبدء، أو استخدم /help.",
+        parse_mode="Markdown",
+    )
 
 
 async def cmd_help(update, context):
@@ -527,9 +533,9 @@ async def do_download(update, context, msg, url, quality, info):
             pct = min(100, done / total * 100)
             filled = min(20, int(pct / 5))
             bar = "█" * filled + "░" * (20 - filled)
-            text = f"⬇️ *تنزيل الملف*\\n\\nالمهمة: {task_id}\\n[{bar}] {pct:.1f}%\\n💾 {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s"
+            text = f"⬇️ *تنزيل الملف*\n\nالمهمة: {task_id}\n[{bar}] {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
         else:
-            text = f"⬇️ *تنزيل الملف*\\n\\nالمهمة: {task_id}\\n💾 {human_size(done)}\\n⚡ {human_size(speed)}/s"
+            text = f"⬇️ *تنزيل الملف*\n\nالمهمة: {task_id}\n💾 {human_size(done)}\n⚡ {human_size(speed)}/s"
         loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
     try:
@@ -580,11 +586,11 @@ async def do_download(update, context, msg, url, quality, info):
                     return
                 upload_sample["last_edit"] = now
                 pct = done / total * 100 if total else 0
-                text = f"📤 *رفع إلى Google Drive*\\n\\nالمهمة: {task_id}\\nالتقدم: {pct:.1f}% — {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s\\n⏱️ {human_time(now - upload_started)}"
+                text = f"📤 *رفع إلى Google Drive*\n\nالمهمة: {task_id}\nالتقدم: {pct:.1f}% — {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s\n⏱️ {human_time(now - upload_started)}"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
-            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\\n💾 {human_size(size)}\\nالمهمة: {task_id}")
-            result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress)
+            await msg.edit_text(f"📤 جارٍ الرفع إلى Drive...\n💾 {human_size(size)}\nالمهمة: {task_id}")
+            result = await asyncio.to_thread(upload_to_drive, file_path, upload_progress, cancelled)
             elapsed = time.time() - started
             persist_task({
                 "task_id": task_id, "user_id": uid, "url": url,
@@ -594,10 +600,10 @@ async def do_download(update, context, msg, url, quality, info):
                 "average_bytes_per_second": round(size / elapsed, 2) if elapsed else 0,
             })
             await msg.edit_text(
-                f"✅ *تم الحفظ والتحقق في Drive!*\\n\\n📁 [{result['name']}]({result['link']})"
-                f"\\n💾 الحجم: {human_size(size)}\\n⏱️ الوقت الكلي: {human_time(elapsed)}"
-                f"\\n⚡ متوسط السرعة الكلية: {human_size(size / elapsed if elapsed else 0)}/s"
-                f"\\n🆔 المهمة: {task_id}",
+                f"✅ *تم الحفظ والتحقق في Drive!*\n\n📁 [{result['name']}]({result['link']})"
+                f"\n💾 الحجم: {human_size(size)}\n⏱️ الوقت الكلي: {human_time(elapsed)}"
+                f"\n⚡ متوسط السرعة الكلية: {human_size(size / elapsed if elapsed else 0)}/s"
+                f"\n🆔 المهمة: {task_id}",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
@@ -605,7 +611,7 @@ async def do_download(update, context, msg, url, quality, info):
         logger.error("Task %s failed: %s", task_id, exc, exc_info=True)
         persist_task({"task_id": task_id, "user_id": uid, "url": url, "status": "failed", "error": str(exc)[:500]})
         try:
-            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\\n{str(exc)[:300]}")
+            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
         except Exception:
             pass
     finally:
@@ -622,9 +628,9 @@ async def handle_telegram_file(update, context, file_obj):
             InlineKeyboardButton("❌ إلغاء", callback_data=f"large_cancel|{sid}"),
         ]])
         await update.message.reply_text(
-            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\\n\\n"
-            f"💾 الحجم: {human_size(file_size)}\\n"
-            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\\n\\n"
+            "📦 *الملف يتجاوز حد التنزيل المباشر للبوت*\n\n"
+            f"💾 الحجم: {human_size(file_size)}\n"
+            "للمتابعة، افتح بوت تحويل الملف إلى رابط وأرسل الملف إليه. بعد حصولك على الرابط، أرسله هنا ليُرفع إلى Google Drive.\n\n"
             "هل تريد المتابعة؟",
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -639,7 +645,7 @@ async def handle_telegram_file(update, context, file_obj):
         "name": getattr(file_obj, "file_name", None), "started_at": started,
     }
     persist_task({"task_id": task_id, "user_id": uid, "status": "telegram_download_started", "started_at": started})
-    msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\\nالمهمة: {task_id}")
+    msg = await update.message.reply_text(f"📥 جارٍ التنزيل من Telegram...\nالمهمة: {task_id}")
     try:
         tg = await context.bot.get_file(file_obj.file_id)
         raw_name = getattr(file_obj, "file_name", None) or f"telegram_{getattr(file_obj, 'file_unique_id', task_id)}"
@@ -663,7 +669,7 @@ async def handle_telegram_file(update, context, file_obj):
                 if now - sample["last_edit"] < PROGRESS_UPDATE_INTERVAL and done < total:
                     return
                 sample["last_edit"] = now
-                text = f"📤 رفع إلى Drive: {pct:.1f}%\\n💾 {human_size(done)} / {human_size(total)}\\n⚡ {human_size(speed)}/s"
+                text = f"📤 رفع إلى Drive: {pct:.1f}%\n💾 {human_size(done)} / {human_size(total)}\n⚡ {human_size(speed)}/s"
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_edit(msg, text)))
 
             result = await asyncio.to_thread(upload_to_drive, path, upload_progress)
@@ -674,15 +680,15 @@ async def handle_telegram_file(update, context, file_obj):
                 "elapsed_seconds": round(elapsed, 2),
             })
             await msg.edit_text(
-                f"✅ *تم الحفظ والتحقق في Drive!*\\n\\n📁 [{result['name']}]({result['link']})"
-                f"\\n💾 {human_size(size)}\\n⏱️ {human_time(elapsed)}\\n🆔 المهمة: {task_id}",
+                f"✅ *تم الحفظ والتحقق في Drive!*\n\n📁 [{result['name']}]({result['link']})"
+                f"\n💾 {human_size(size)}\n⏱️ {human_time(elapsed)}\n🆔 المهمة: {task_id}",
                 parse_mode="Markdown", disable_web_page_preview=True,
             )
     except Exception as exc:
         logger.error("Telegram file task %s failed: %s", task_id, exc, exc_info=True)
         persist_task({"task_id": task_id, "user_id": uid, "status": "failed", "error": str(exc)[:500]})
         try:
-            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\\n{str(exc)[:300]}")
+            await msg.edit_text(f"❌ فشلت المهمة {task_id}:\n{str(exc)[:300]}")
         except Exception:
             pass
     finally:
