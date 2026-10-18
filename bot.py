@@ -668,6 +668,18 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
         shutil.rmtree(parts_dir, ignore_errors=True)
 
 
+def _http_retry_delay(exc, attempt):
+    """Respect Retry-After when present; otherwise use bounded exponential backoff."""
+    response = getattr(exc, "response", None)
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            return min(120, max(1, int(float(retry_after))))
+        except (TypeError, ValueError):
+            pass
+    return min(60, 3 * (2 ** attempt))
+
+
 def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
     filename = urlparse(url).path.rsplit("/", 1)[-1] or "downloaded_file"
     filename = "".join(c for c in filename if c.isalnum() or c in "._- ") or "downloaded_file"
@@ -720,8 +732,18 @@ def download_direct(url, out_dir, progress_cb=None, cancel_check=None):
         except Exception as exc:
             if "__CANCELLED__" in str(exc) or attempt >= attempts - 1:
                 raise
-            delay = attempt + 1
-            logger.warning("Direct download attempt %s/%s failed; retrying in %ss: %s", attempt + 1, attempts, delay, exc)
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            # Retry temporary server/rate-limit errors; fail fast on most permanent client errors.
+            if status is not None and status not in (408, 425, 429) and status < 500:
+                raise
+            delay = _http_retry_delay(exc, attempt)
+            logger.warning(
+                "Direct download attempt %s/%s failed%s; retrying in %ss: %s",
+                attempt + 1, attempts,
+                f" (HTTP {status})" if status else "",
+                delay, exc,
+            )
             time.sleep(delay)
     raise RuntimeError("Direct download failed after retries.")
 
