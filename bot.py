@@ -440,10 +440,9 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
     parts_dir = tempfile.mkdtemp(prefix=".drive-saver-parts-", dir=out_dir)
     temporary_output = output_path + ".parallel.tmp"
     progress_lock = threading.Lock()
-    downloaded = 0
+    part_progress = {index: 0 for index in range(len(ranges))}
 
     def fetch_range(index, start, end):
-        nonlocal downloaded
         expected = end - start + 1
         part_path = os.path.join(parts_dir, f"{index:06d}.part")
         range_headers = {**headers, "Range": f"bytes={start}-{end}"}
@@ -452,6 +451,8 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
                 raise RuntimeError("__CANCELLED__")
             try:
                 received = 0
+                with progress_lock:
+                    part_progress[index] = 0
                 with requests.get(
                     url, stream=True, timeout=(15, 120), headers=range_headers
                 ) as response:
@@ -474,10 +475,10 @@ def download_direct_parallel(url, out_dir, output_path, progress_cb=None, cancel
                             handle.write(chunk)
                             received += len(chunk)
                             with progress_lock:
-                                downloaded += len(chunk)
+                                part_progress[index] = received
                                 if progress_cb:
                                     progress_cb({
-                                        "downloaded_bytes": downloaded,
+                                        "downloaded_bytes": sum(part_progress.values()),
                                         "total_bytes": total,
                                     })
                 if received != expected:
