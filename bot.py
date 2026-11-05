@@ -478,7 +478,7 @@ def _valid_http_url(candidate):
 def extract_urls(text):
     """Extract unique HTTP(S) URLs in appearance order, preserving balanced brackets."""
     urls, seen = [], set()
-    for match in re.finditer(r"https?://[^\\s<>\\\"']+", text or "", re.IGNORECASE):
+    for match in re.finditer(r"""https?://[^\s<>"']+""", text or "", re.IGNORECASE):
         candidate = _trim_url_candidate(match.group(0))
         if candidate and _valid_http_url(candidate) and candidate not in seen:
             seen.add(candidate)
@@ -518,7 +518,7 @@ def extract_message_urls(message):
             target = getattr(entity, "url", None)
             if target and _valid_http_url(target):
                 positioned.append((begin, target))
-        for match in re.finditer(r"https?://[^\\s<>\\\"']+", value, re.IGNORECASE):
+    for match in re.finditer(r"""https?://[^\s<>"']+""", value, re.IGNORECASE):
             if any(match.start() < finish and match.end() > begin for begin, finish in hidden_ranges):
                 continue
             candidate = _trim_url_candidate(match.group(0))
