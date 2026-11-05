@@ -1499,17 +1499,26 @@ async def handle_message(update, context):
         message.document or message.video or message.audio or message.animation
         or message.voice or message.video_note or (message.photo[-1] if message.photo else None)
     )
-    text = (message.text or message.caption or "").strip()
-    urls = extract_urls(text)
-    handled = False
+    urls = extract_message_urls(message)
+    handled = bool(file_obj or urls)
     if file_obj:
-        await handle_telegram_file(update, context, file_obj)
-        handled = True
-    for url in urls:
-        await handle_link(update, context, url)
-        handled = True
+        try:
+            await handle_telegram_file(update, context, file_obj)
+        except Exception as exc:
+            logger.exception("Telegram attachment processing failed")
+            await message.reply_text(f"❌ تعذرت معالجة الملف المرفق: {str(exc)[:250]}")
+    for index, url in enumerate(urls, 1):
+        try:
+            await handle_link(update, context, url)
+        except Exception as exc:
+            # One bad URL must not prevent later links in the same Telegram message.
+            logger.exception("Link %s/%s failed: %s", index, len(urls), url)
+            await message.reply_text(
+                f"❌ تعذرت معالجة الرابط {index}/{len(urls)}:\n{url[:300]}\n{str(exc)[:180]}",
+                disable_web_page_preview=True,
+            )
     if not handled:
-        await update.message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
+        await message.reply_text("❓ أرسل رابطاً أو ملفاً، أو /help.")
 
 
 def find_duplicate_url_task(url):
