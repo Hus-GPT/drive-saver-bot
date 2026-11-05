@@ -1,6 +1,8 @@
+import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
@@ -590,6 +592,81 @@ class UnifiedIntakeTests(unittest.TestCase):
             bot.extract_urls("Caption: https://example.com/file.pdf"),
             ["https://example.com/file.pdf"],
         )
+
+    def test_extract_urls_handles_sentence_punctuation_and_balanced_parentheses(self):
+        self.assertEqual(
+            bot.extract_urls(
+                "A https://example.com/path_(part). ثم https://second.example/file). "
+                "https://example.com/path_(part)"
+            ),
+            [
+                "https://example.com/path_(part)",
+                "https://second.example/file",
+            ],
+        )
+
+    def test_extract_message_urls_combines_text_caption_and_deduplicates(self):
+        message = SimpleNamespace(
+            text="Text link: https://one.example/a,",
+            caption="Caption link: https://two.example/b and https://one.example/a.",
+            entities=[],
+            caption_entities=[],
+        )
+        self.assertEqual(
+            bot.extract_message_urls(message),
+            ["https://one.example/a", "https://two.example/b"],
+        )
+
+    def test_extract_message_urls_includes_hidden_telegram_text_links_in_order(self):
+        text = "🙂 قبل هذا الرابط وبعده https://visible.example/file"
+        label = "هذا الرابط"
+        offset = len(text[:text.index(label)].encode("utf-16-le")) // 2
+        length = len(label.encode("utf-16-le")) // 2
+        message = SimpleNamespace(
+            text=text,
+            caption=None,
+            entities=[SimpleNamespace(
+                type="text_link", offset=offset, length=length,
+                url="https://hidden.example/target",
+            )],
+            caption_entities=[],
+        )
+        self.assertEqual(
+            bot.extract_message_urls(message),
+            ["https://hidden.example/target", "https://visible.example/file"],
+        )
+
+    def test_handle_message_continues_after_one_link_fails(self):
+        message = SimpleNamespace(
+            text="https://first.example/a https://broken.example/b https://third.example/c",
+            caption=None, entities=[], caption_entities=[],
+            document=None, video=None, audio=None, animation=None,
+            voice=None, video_note=None, photo=None,
+            replies=[],
+        )
+
+        async def reply_text(text, **kwargs):
+            message.replies.append(text)
+
+        message.reply_text = reply_text
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=bot.OWNER_ID),
+            message=message,
+        )
+        attempted = []
+
+        async def fake_handle_link(update, context, url):
+            attempted.append(url)
+            if "broken.example" in url:
+                raise RuntimeError("simulated single-link failure")
+
+        with patch.object(bot, "handle_link", side_effect=fake_handle_link):
+            asyncio.run(bot.handle_message(update, SimpleNamespace()))
+
+        self.assertEqual(len(attempted), 3)
+        self.assertIn("third.example", attempted[2])
+        self.assertEqual(len(message.replies), 1)
+        self.assertIn("broken.example", message.replies[0])
 
     def test_google_drive_file_id_variants(self):
         cases = {
