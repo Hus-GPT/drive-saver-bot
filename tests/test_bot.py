@@ -125,22 +125,22 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result["id"], "existing-id")
             media_factory.assert_not_called()
 
-    def test_duplicate_query_is_global_not_limited_to_destination_folder(self):
+    def test_duplicate_query_is_scoped_to_the_destination_folder(self):
         with tempfile.NamedTemporaryFile() as handle:
             handle.write(b"0123456789")
             handle.flush()
             service = FakeService(10, [{
-                "id": "nested-existing-id",
+                "id": "same-folder-existing-id",
                 "name": "sample.bin",
                 "size": "10",
-                "webViewLink": "https://drive.google.com/file/d/nested-existing-id",
+                "webViewLink": "https://drive.google.com/file/d/same-folder-existing-id",
             }])
             with patch.object(bot, "drive_service", service), patch.object(
                 bot, "sha256_file", return_value="abc"
             ), patch.object(bot, "MediaFileUpload", return_value=object()) as media_factory:
-                result = bot.upload_to_drive(handle.name)
+                result = bot.upload_to_drive(handle.name, destination_folder_id="folder-destination")
             self.assertTrue(result["already_exists"])
-            self.assertNotIn("in parents", service.fake_files.last_query)
+            self.assertIn("'folder-destination' in parents", service.fake_files.last_query)
             self.assertIn("appProperties", service.fake_files.last_query)
             media_factory.assert_not_called()
 
