@@ -444,6 +444,11 @@ class TransferTests(unittest.TestCase):
                 return Request(metadata[fileId])
 
             def list(self, **kwargs):
+                query = kwargs.get("q", "")
+                if "'nested-id' in parents" in query:
+                    return Request({"files": [
+                        {"id": "nested-file", "name": "nested.txt", "mimeType": "text/plain", "size": "4"},
+                    ]})
                 return Request({"files": [
                     {"id": "plain-id", "name": "plain.txt", "mimeType": "text/plain", "size": "4"},
                     {"id": "unsupported-id", "name": "unsupported.form",
@@ -451,6 +456,8 @@ class TransferTests(unittest.TestCase):
                     {"id": "shortcut-id", "name": "alias.txt",
                      "mimeType": "application/vnd.google-apps.shortcut",
                      "shortcutDetails": {"targetId": "target-id", "targetMimeType": "text/plain"}},
+                    {"id": "nested-id", "name": "Nested Folder",
+                     "mimeType": "application/vnd.google-apps.folder"},
                 ]})
 
             def get_media(self, fileId):
@@ -486,11 +493,15 @@ class TransferTests(unittest.TestCase):
             }
             self.assertEqual(
                 relative_paths,
-                {"Source Folder/plain.txt", "Source Folder/alias.txt"},
+                {
+                    "Source Folder/plain.txt",
+                    "Source Folder/alias.txt",
+                    os.path.join("Source Folder", "Nested Folder", "nested.txt"),
+                },
             )
             self.assertEqual(len(result.failures), 1)
             self.assertIn("unsupported.form", result.failures[0]["name"])
-            self.assertEqual(len(progress), 2)
+            self.assertEqual(len(progress), 3)
             for path, _ in result:
                 with open(path, "rb") as handle:
                     self.assertEqual(handle.read(), b"data")
