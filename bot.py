@@ -607,12 +607,12 @@ def download_google_drive_resource(url, out_dir, service=None, progress_cb=None,
             request = service.files().export_media(fileId=item["id"], mimeType=export_mime)
         else:
             request = service.files().get_media(fileId=item["id"])
-        raw_parts = list(relative_parts) + [name]
-        parts = [
-            re.sub(r'[<>:"|?*\\\\/]', "_", str(part)).strip() or "file"
-            for part in raw_parts if str(part) not in ("", ".", os.sep)
+        safe_relative_parts = [
+            re.sub(r'[<>:"|?*\\/]', "_", str(part)).strip() or "folder"
+            for part in relative_parts
         ]
-        target = root.joinpath(*parts)
+        safe_name = re.sub(r'[<>:"|?*\\/]', "_", str(name)).strip() or "file"
+        target = root.joinpath(*(safe_relative_parts + [safe_name]))
         target.parent.mkdir(parents=True, exist_ok=True)
         total = int(item.get("size") or 0)
         try:
