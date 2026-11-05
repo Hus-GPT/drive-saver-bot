@@ -453,26 +453,81 @@ def human_time(s):
     return f"{h}:{m:02d}:{sec:02d} س"
 
 
-def extract_first_url(text):
-    """Extract the first URL from a shared message, ignoring trailing punctuation."""
-    for match in re.finditer(r"https?://[^\s<>]+", text or "", re.IGNORECASE):
-        candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}）»”’")
+def _trim_url_candidate(candidate):
+    candidate = (candidate or "").rstrip(".,!?;:،。！？；：…")
+    pairs = ((")", "("), ("]", "["), ("}", "{"), ("）", "（"), ("】", "【"))
+    changed = True
+    while candidate and changed:
+        changed = False
+        for closing, opening in pairs:
+            if candidate.endswith(closing) and candidate.count(closing) > candidate.count(opening):
+                candidate = candidate[:-1]
+                changed = True
+    return candidate.rstrip("»”’'\\\"")
+
+
+def _valid_http_url(candidate):
+    try:
         parsed = urlparse(candidate)
-        if parsed.scheme in ("http", "https") and parsed.netloc:
-            return candidate
-    return None
+        return parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname) and not any(c.isspace() for c in candidate)
+    except ValueError:
+        return False
 
 
 def extract_urls(text):
-    """Extract all unique HTTP(S) URLs in first-seen order."""
+    """Extract unique HTTP(S) URLs in appearance order, preserving balanced brackets."""
     urls, seen = [], set()
-    for match in re.finditer(r"https?://[^\s<>]+", text or "", re.IGNORECASE):
-        candidate = match.group(0).rstrip(".,!?;:،。！？；：)]}»”’")
-        parsed = urlparse(candidate)
-        if parsed.scheme in ("http", "https") and parsed.netloc and candidate not in seen:
+    for match in re.finditer(r"https?://[^\\s<>\\\"']+", text or "", re.IGNORECASE):
+        candidate = _trim_url_candidate(match.group(0))
+        if candidate and _valid_http_url(candidate) and candidate not in seen:
             seen.add(candidate)
             urls.append(candidate)
     return urls
+
+
+def extract_first_url(text):
+    urls = extract_urls(text)
+    return urls[0] if urls else None
+
+
+def _utf16_offset_to_index(value, offset):
+    units = 0
+    for index, char in enumerate(value or ""):
+        if units >= offset:
+            return index
+        units += len(char.encode("utf-16-le")) // 2
+    return len(value or "")
+
+
+def extract_message_urls(message):
+    """Collect visible and hidden Telegram links from message text and captions."""
+    found, seen = [], set()
+    sources = ((getattr(message, "text", None) or "", getattr(message, "entities", None) or []),
+               (getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []))
+    for value, entities in sources:
+        positioned, hidden_ranges = [], []
+        for entity in entities:
+            if getattr(entity, "type", None) != "text_link":
+                continue
+            offset = int(getattr(entity, "offset", 0))
+            length = int(getattr(entity, "length", 0))
+            begin = _utf16_offset_to_index(value, offset)
+            finish = _utf16_offset_to_index(value, offset + length)
+            hidden_ranges.append((begin, finish))
+            target = getattr(entity, "url", None)
+            if target and _valid_http_url(target):
+                positioned.append((begin, target))
+        for match in re.finditer(r"https?://[^\\s<>\\\"']+", value, re.IGNORECASE):
+            if any(match.start() < finish and match.end() > begin for begin, finish in hidden_ranges):
+                continue
+            candidate = _trim_url_candidate(match.group(0))
+            if candidate and _valid_http_url(candidate):
+                positioned.append((match.start(), candidate))
+        for _, url in sorted(positioned, key=lambda item: item[0]):
+            if url not in seen:
+                seen.add(url)
+                found.append(url)
+    return found
 
 
 def is_google_drive_url(url):
