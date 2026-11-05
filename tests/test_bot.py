@@ -1,6 +1,8 @@
+import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
@@ -123,22 +125,22 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(result["id"], "existing-id")
             media_factory.assert_not_called()
 
-    def test_duplicate_query_is_global_not_limited_to_destination_folder(self):
+    def test_duplicate_query_is_scoped_to_the_destination_folder(self):
         with tempfile.NamedTemporaryFile() as handle:
             handle.write(b"0123456789")
             handle.flush()
             service = FakeService(10, [{
-                "id": "nested-existing-id",
+                "id": "same-folder-existing-id",
                 "name": "sample.bin",
                 "size": "10",
-                "webViewLink": "https://drive.google.com/file/d/nested-existing-id",
+                "webViewLink": "https://drive.google.com/file/d/same-folder-existing-id",
             }])
             with patch.object(bot, "drive_service", service), patch.object(
                 bot, "sha256_file", return_value="abc"
             ), patch.object(bot, "MediaFileUpload", return_value=object()) as media_factory:
-                result = bot.upload_to_drive(handle.name)
+                result = bot.upload_to_drive(handle.name, destination_folder_id="folder-destination")
             self.assertTrue(result["already_exists"])
-            self.assertNotIn("in parents", service.fake_files.last_query)
+            self.assertIn("'folder-destination' in parents", service.fake_files.last_query)
             self.assertIn("appProperties", service.fake_files.last_query)
             media_factory.assert_not_called()
 
@@ -420,6 +422,90 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(duplicate["task_id"], "short1")
         self.assertEqual(duplicate["kind"], "quality")
 
+    def test_drive_folder_resolves_shortcuts_and_skips_unsupported_items(self):
+        class Request:
+            def __init__(self, value):
+                self.value = value
+            def execute(self, num_retries=0):
+                return self.value
+
+        class Files:
+            def get(self, fileId, fields):
+                metadata = {
+                    "folder-id": {
+                        "id": "folder-id", "name": "Source Folder",
+                        "mimeType": "application/vnd.google-apps.folder",
+                    },
+                    "target-id": {
+                        "id": "target-id", "name": "original.txt",
+                        "mimeType": "text/plain", "size": "4",
+                    },
+                }
+                return Request(metadata[fileId])
+
+            def list(self, **kwargs):
+                query = kwargs.get("q", "")
+                if "'nested-id' in parents" in query:
+                    return Request({"files": [
+                        {"id": "nested-file", "name": "nested.txt", "mimeType": "text/plain", "size": "4"},
+                    ]})
+                return Request({"files": [
+                    {"id": "plain-id", "name": "plain.txt", "mimeType": "text/plain", "size": "4"},
+                    {"id": "unsupported-id", "name": "unsupported.form",
+                     "mimeType": "application/vnd.google-apps.form"},
+                    {"id": "shortcut-id", "name": "alias.txt",
+                     "mimeType": "application/vnd.google-apps.shortcut",
+                     "shortcutDetails": {"targetId": "target-id", "targetMimeType": "text/plain"}},
+                    {"id": "nested-id", "name": "Nested Folder",
+                     "mimeType": "application/vnd.google-apps.folder"},
+                ]})
+
+            def get_media(self, fileId):
+                return b"data"
+
+        class Service:
+            def files(self):
+                return Files()
+
+        class Downloader:
+            def __init__(self, handle, request, chunksize):
+                self.handle = handle
+                self.request = request
+                self.done = False
+            def next_chunk(self, num_retries=0):
+                if not self.done:
+                    self.handle.write(self.request)
+                    self.done = True
+                return None, True
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            bot, "MediaIoBaseDownload", Downloader
+        ):
+            progress = []
+            result = bot.download_google_drive_resource(
+                "https://drive.google.com/drive/folders/folder-id",
+                tmp,
+                service=Service(),
+                progress_cb=progress.append,
+            )
+            relative_paths = {
+                os.path.relpath(path, tmp) for path, _ in result
+            }
+            self.assertEqual(
+                relative_paths,
+                {
+                    "Source Folder/plain.txt",
+                    "Source Folder/alias.txt",
+                    os.path.join("Source Folder", "Nested Folder", "nested.txt"),
+                },
+            )
+            self.assertEqual(len(result.failures), 1)
+            self.assertIn("unsupported.form", result.failures[0]["name"])
+            self.assertEqual(len(progress), 3)
+            for path, _ in result:
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), b"data")
+
     def test_duplicate_telegram_file_is_detected(self):
         task = {"id": "tg123", "user_id": 123456, "file_unique_id": "unique-file"}
         with patch.dict(bot.active_tasks, {"tg123": task}, clear=True), patch.dict(
@@ -574,6 +660,242 @@ class TransferTests(unittest.TestCase):
     def test_direct_file_url_detection_uses_path_not_query(self):
         self.assertTrue(bot.is_likely_direct_file_url("https://example.com/archive.zip?token=abc"))
         self.assertFalse(bot.is_likely_direct_file_url("https://example.com/watch?id=archive.zip"))
+
+
+
+class UnifiedIntakeTests(unittest.TestCase):
+    def test_extract_urls_returns_all_unique_urls_in_order(self):
+        text = "First https://example.com/a, then https://drive.google.com/file/d/abc/view and https://example.com/a!"
+        self.assertEqual(
+            bot.extract_urls(text),
+            ["https://example.com/a", "https://drive.google.com/file/d/abc/view"],
+        )
+
+    def test_extract_urls_uses_caption_text_too_at_handler_level(self):
+        self.assertEqual(
+            bot.extract_urls("Caption: https://example.com/file.pdf"),
+            ["https://example.com/file.pdf"],
+        )
+
+    def test_extract_urls_handles_sentence_punctuation_and_balanced_parentheses(self):
+        self.assertEqual(
+            bot.extract_urls(
+                "A https://example.com/path_(part). ثم https://second.example/file). "
+                "https://example.com/path_(part)"
+            ),
+            [
+                "https://example.com/path_(part)",
+                "https://second.example/file",
+            ],
+        )
+
+    def test_extract_message_urls_combines_text_caption_and_deduplicates(self):
+        message = SimpleNamespace(
+            text="Text link: https://one.example/a,",
+            caption="Caption link: https://two.example/b and https://one.example/a.",
+            entities=[],
+            caption_entities=[],
+        )
+        self.assertEqual(
+            bot.extract_message_urls(message),
+            ["https://one.example/a", "https://two.example/b"],
+        )
+
+    def test_extract_message_urls_includes_hidden_telegram_text_links_in_order(self):
+        text = "🙂 قبل هذا الرابط وبعده https://visible.example/file"
+        label = "هذا الرابط"
+        offset = len(text[:text.index(label)].encode("utf-16-le")) // 2
+        length = len(label.encode("utf-16-le")) // 2
+        message = SimpleNamespace(
+            text=text,
+            caption=None,
+            entities=[SimpleNamespace(
+                type="text_link", offset=offset, length=length,
+                url="https://hidden.example/target",
+            )],
+            caption_entities=[],
+        )
+        self.assertEqual(
+            bot.extract_message_urls(message),
+            ["https://hidden.example/target", "https://visible.example/file"],
+        )
+
+    def test_handle_message_continues_after_one_link_fails(self):
+        message = SimpleNamespace(
+            text="https://first.example/a https://broken.example/b https://third.example/c",
+            caption=None, entities=[], caption_entities=[],
+            document=None, video=None, audio=None, animation=None,
+            voice=None, video_note=None, photo=None,
+            replies=[],
+        )
+
+        async def reply_text(text, **kwargs):
+            message.replies.append(text)
+
+        message.reply_text = reply_text
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=bot.OWNER_ID),
+            message=message,
+        )
+        attempted = []
+
+        async def fake_handle_link(update, context, url):
+            attempted.append(url)
+            if "broken.example" in url:
+                raise RuntimeError("simulated single-link failure")
+
+        with patch.object(bot, "handle_link", side_effect=fake_handle_link):
+            asyncio.run(bot.handle_message(update, SimpleNamespace()))
+
+        self.assertEqual(len(attempted), 3)
+        self.assertIn("third.example", attempted[2])
+        self.assertEqual(len(message.replies), 1)
+        self.assertIn("broken.example", message.replies[0])
+
+    def test_google_drive_file_id_variants(self):
+        cases = {
+            "https://drive.google.com/file/d/FILE_123/view?usp=sharing": "FILE_123",
+            "https://drive.google.com/drive/folders/FOLDER-123?usp=sharing": "FOLDER-123",
+            "https://docs.google.com/spreadsheets/d/SHEET_123/edit": "SHEET_123",
+            "https://drive.google.com/open?id=QUERY_123": "QUERY_123",
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(bot.google_drive_file_id(url), expected)
+
+    def test_google_drive_host_detection(self):
+        self.assertTrue(bot.is_google_drive_url("https://drive.google.com/file/d/abc/view"))
+        self.assertTrue(bot.is_google_drive_url("https://docs.google.com/document/d/abc/edit"))
+        self.assertFalse(bot.is_google_drive_url("https://example.com/drive.google.com/file"))
+
+    def test_ytdlp_cookie_file_is_optional_and_not_added_if_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cookie_path = os.path.join(tmp, "cookies.txt")
+            with patch.dict(os.environ, {"YTDLP_COOKIES_FILE": cookie_path}):
+                self.assertNotIn("cookiefile", bot.ytdlp_opts())
+                with open(cookie_path, "w", encoding="utf-8") as handle:
+                    handle.write("# Netscape HTTP Cookie File\\n")
+                self.assertEqual(bot.ytdlp_opts()["cookiefile"], cookie_path)
+
+    def test_quality_keyboard_offers_best_available_and_8k_when_present(self):
+        formats = [
+            {"height": 4320, "vcodec": "av01", "acodec": "none"},
+            {"height": 1080, "vcodec": "avc1", "acodec": "none"},
+            {"height": 720, "vcodec": "none", "acodec": "mp4a"},
+        ]
+        class FakeButton:
+            def __init__(self, text, callback_data):
+                self.text, self.callback_data = text, callback_data
+        class FakeMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+        with patch.object(bot, "InlineKeyboardButton", FakeButton), patch.object(
+            bot, "InlineKeyboardMarkup", FakeMarkup
+        ):
+            markup = bot.build_quality_keyboard("abc123", formats)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("dl|abc123|best", callbacks)
+        self.assertIn("dl|abc123|4320", callbacks)
+        self.assertIn("dl|abc123|1080", callbacks)
+        self.assertIn("dl|abc123|720", callbacks)
+
+    def test_best_quality_download_does_not_apply_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "best")
+        self.assertEqual(captured["format"], "bestvideo+bestaudio/best")
+
+    def test_numeric_quality_download_keeps_requested_height_cap(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                return {"title": "sample", "ext": "mp4"}
+            def prepare_filename(self, info):
+                return "/tmp/sample.mp4"
+        with patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            bot.download_video("https://example.com/video", "/tmp", "720")
+        self.assertEqual(captured["format"], "bestvideo[height<=720]+bestaudio/best[height<=720]/best")
+
+    def test_youtube_playlist_url_detection(self):
+        self.assertTrue(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/playlist?list=PL_example"
+        ))
+        self.assertTrue(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/watch?v=abc123&list=PL_example"
+        ))
+        self.assertFalse(bot.is_youtube_playlist_url(
+            "https://www.youtube.com/watch?v=abc123"
+        ))
+        self.assertFalse(bot.is_youtube_playlist_url(
+            "https://example.com/playlist?list=PL_example"
+        ))
+
+    def test_missing_format_metadata_still_offers_explicit_quality_choices(self):
+        class FakeButton:
+            def __init__(self, text, callback_data):
+                self.text, self.callback_data = text, callback_data
+        class FakeMarkup:
+            def __init__(self, inline_keyboard):
+                self.inline_keyboard = inline_keyboard
+        with patch.object(bot, "InlineKeyboardButton", FakeButton), patch.object(
+            bot, "InlineKeyboardMarkup", FakeMarkup
+        ):
+            markup = bot.build_quality_keyboard("fallback1", [])
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("dl|fallback1|best", callbacks)
+        self.assertIn("dl|fallback1|720", callbacks)
+        self.assertIn("dl|fallback1|1080", callbacks)
+        self.assertIn("dl|fallback1|mp3", callbacks)
+
+    def test_playlist_download_enables_playlist_mode_and_preserves_chosen_quality(self):
+        captured = {}
+        class FakeYDL:
+            def __init__(self, options):
+                captured.update(options)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def extract_info(self, url, download=True):
+                for name in ("001 - First.mp4", "002 - Second.mp4"):
+                    with open(os.path.join(captured["outtmpl"].rsplit("/", 1)[0], name), "wb") as handle:
+                        handle.write(b"video")
+                return {"_type": "playlist", "entries": [{}, {}]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bot.yt_dlp, "YoutubeDL", FakeYDL):
+            paths = bot.download_youtube_playlist(
+                "https://www.youtube.com/playlist?list=PL_example", tmp, "720"
+            )
+        self.assertEqual(len(paths), 2)
+        self.assertFalse(captured["noplaylist"])
+        self.assertIn("%(playlist_index)03d", captured["outtmpl"])
+        self.assertEqual(
+            captured["format"],
+            "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        )
+        self.assertTrue(captured["ignoreerrors"])
+
+    def test_youtube_bot_challenge_is_recognized(self):
+        self.assertTrue(bot.is_youtube_bot_challenge(
+            "Sign in to confirm you're not a bot. Use --cookies-from-browser"
+        ))
+        self.assertFalse(bot.is_youtube_bot_challenge("HTTP Error 404"))
 
 
 if __name__ == "__main__":
