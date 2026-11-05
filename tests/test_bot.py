@@ -422,6 +422,79 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(duplicate["task_id"], "short1")
         self.assertEqual(duplicate["kind"], "quality")
 
+    def test_drive_folder_resolves_shortcuts_and_skips_unsupported_items(self):
+        class Request:
+            def __init__(self, value):
+                self.value = value
+            def execute(self, num_retries=0):
+                return self.value
+
+        class Files:
+            def get(self, fileId, fields):
+                metadata = {
+                    "folder-id": {
+                        "id": "folder-id", "name": "Source Folder",
+                        "mimeType": "application/vnd.google-apps.folder",
+                    },
+                    "target-id": {
+                        "id": "target-id", "name": "original.txt",
+                        "mimeType": "text/plain", "size": "4",
+                    },
+                }
+                return Request(metadata[fileId])
+
+            def list(self, **kwargs):
+                return Request({"files": [
+                    {"id": "plain-id", "name": "plain.txt", "mimeType": "text/plain", "size": "4"},
+                    {"id": "unsupported-id", "name": "unsupported.form",
+                     "mimeType": "application/vnd.google-apps.form"},
+                    {"id": "shortcut-id", "name": "alias.txt",
+                     "mimeType": "application/vnd.google-apps.shortcut",
+                     "shortcutDetails": {"targetId": "target-id", "targetMimeType": "text/plain"}},
+                ]})
+
+            def get_media(self, fileId):
+                return b"data"
+
+        class Service:
+            def files(self):
+                return Files()
+
+        class Downloader:
+            def __init__(self, handle, request, chunksize):
+                self.handle = handle
+                self.request = request
+                self.done = False
+            def next_chunk(self, num_retries=0):
+                if not self.done:
+                    self.handle.write(self.request)
+                    self.done = True
+                return None, True
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            bot, "MediaIoBaseDownload", Downloader
+        ):
+            progress = []
+            result = bot.download_google_drive_resource(
+                "https://drive.google.com/drive/folders/folder-id",
+                tmp,
+                service=Service(),
+                progress_cb=progress.append,
+            )
+            relative_paths = {
+                os.path.relpath(path, tmp) for path, _ in result
+            }
+            self.assertEqual(
+                relative_paths,
+                {"Source Folder/plain.txt", "Source Folder/alias.txt"},
+            )
+            self.assertEqual(len(result.failures), 1)
+            self.assertIn("unsupported.form", result.failures[0]["name"])
+            self.assertEqual(len(progress), 2)
+            for path, _ in result:
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), b"data")
+
     def test_duplicate_telegram_file_is_detected(self):
         task = {"id": "tg123", "user_id": 123456, "file_unique_id": "unique-file"}
         with patch.dict(bot.active_tasks, {"tg123": task}, clear=True), patch.dict(
