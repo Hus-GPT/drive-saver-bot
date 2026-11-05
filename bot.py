@@ -636,7 +636,7 @@ def download_google_drive_resource(url, out_dir, service=None, progress_cb=None,
             except OSError:
                 pass
             raise
-        results.append((str(target), str(Path(*relative_parts)) if relative_parts else "."))
+        results.append((str(target), str(Path(*safe_relative_parts)) if safe_relative_parts else "."))
 
     def walk(folder_id, relative_parts, depth=0, ancestry=frozenset()):
         check_cancelled()
