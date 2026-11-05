@@ -621,7 +621,7 @@ def download_google_drive_resource(url, out_dir, service=None, progress_cb=None,
                 done = False
                 while not done:
                     check_cancelled()
-                    downloader.next_chunk(num_retries=3)
+                    _, done = downloader.next_chunk(num_retries=3)
                     if progress_cb:
                         progress_cb({
                             "downloaded_bytes": handle.tell(),
