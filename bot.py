@@ -369,10 +369,11 @@ def upload_to_drive(file_path, progress_cb=None, cancel_check=None, destination_
     expected_size = os.path.getsize(file_path)
     fingerprint = sha256_file(file_path)
     service = drive_service or get_drive_service()
-    # Search across the entire Drive, not only the destination root. This
-    # prevents identical content from being duplicated in nested folders too.
+    # Check duplicates only in the destination folder; global matching could
+    # silently collapse identical files from different source subfolders.
+    destination_id = destination_folder_id or DRIVE_FOLDER_ID
     query = (
-        "trashed = false and "
+        f"trashed = false and '{destination_id}' in parents and "
         f"appProperties has {{ key='sha256' and value='{fingerprint}' }}"
     )
     existing = service.files().list(
@@ -554,18 +555,49 @@ DRIVE_EXPORT_TYPES = {
 }
 
 
-def download_google_drive_resource(url, out_dir, service=None):
-    """Download a Drive file or recursively download a folder, exporting supported native Docs."""
+class DriveDownloadResults(list):
+    """List-compatible download results with explicit per-item failures."""
+    def __init__(self, values=(), failures=None):
+        super().__init__(values)
+        self.failures = list(failures or [])
+
+
+def download_google_drive_resource(url, out_dir, service=None, progress_cb=None, cancel_check=None):
+    """Download Drive files/folders, resolve shortcuts, and continue past item-level failures."""
     file_id = google_drive_file_id(url)
     if not file_id:
         raise RuntimeError("تعذر استخراج معرّف ملف Google Drive من الرابط.")
     service = service or drive_service or get_drive_service()
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
-    results, visited = [], set()
+    results = DriveDownloadResults()
 
-    def save_file(item, relative_parent):
-        mime, name = item.get("mimeType", ""), item.get("name") or item["id"]
+    def check_cancelled():
+        if cancel_check and cancel_check():
+            raise RuntimeError("__CANCELLED__")
+
+    def fail(item, exc):
+        results.failures.append({
+            "name": str(item.get("name") or item.get("id") or "عنصر غير معروف")[:160],
+            "error": str(exc)[:240],
+        })
+        logger.warning("Skipping Google Drive item %s: %s", item.get("name"), exc)
+
+    def resolve_shortcut(item):
+        target_id = (item.get("shortcutDetails") or {}).get("targetId")
+        if not target_id:
+            raise RuntimeError("اختصار Google Drive لا يحتوي على هدف صالح.")
+        target = service.files().get(
+            fileId=target_id,
+            fields="id,name,mimeType,size,webViewLink,shortcutDetails",
+        ).execute(num_retries=3)
+        target["name"] = item.get("name") or target.get("name") or target_id
+        return target
+
+    def save_file(item, relative_parts):
+        check_cancelled()
+        mime = item.get("mimeType", "")
+        name = item.get("name") or item.get("id") or "file"
         if mime.startswith("application/vnd.google-apps.") and mime != "application/vnd.google-apps.folder":
             export = DRIVE_EXPORT_TYPES.get(mime)
             if not export:
@@ -575,51 +607,100 @@ def download_google_drive_resource(url, out_dir, service=None):
             request = service.files().export_media(fileId=item["id"], mimeType=export_mime)
         else:
             request = service.files().get_media(fileId=item["id"])
-        parts = [re.sub(r'[<>:"|?*\\\\]', "_", p).strip() or "file"
-                 for p in Path(relative_parent, name).parts if p not in ("", ".")]
+        raw_parts = list(relative_parts) + [name]
+        parts = [
+            re.sub(r'[<>:"|?*\\\\/]', "_", str(part)).strip() or "file"
+            for part in raw_parts if str(part) not in ("", ".", os.sep)
+        ]
         target = root.joinpath(*parts)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("wb") as handle:
-            downloader = MediaIoBaseDownload(handle, request, chunksize=8 * 1024 * 1024)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk(num_retries=3)
-        results.append((str(target), str(target.relative_to(root).parent)))
+        total = int(item.get("size") or 0)
+        try:
+            with target.open("wb") as handle:
+                downloader = MediaIoBaseDownload(handle, request, chunksize=8 * 1024 * 1024)
+                done = False
+                while not done:
+                    check_cancelled()
+                    downloader.next_chunk(num_retries=3)
+                    if progress_cb:
+                        progress_cb({
+                            "downloaded_bytes": handle.tell(),
+                            "total_bytes": total,
+                            "filename": name,
+                        })
+            if target.stat().st_size == 0:
+                raise RuntimeError("تم تنزيل ملف فارغ.")
+        except Exception:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        results.append((str(target), str(Path(*relative_parts)) if relative_parts else "."))
 
-    def walk(folder_id, relative_dir, depth=0):
+    def walk(folder_id, relative_parts, depth=0, ancestry=frozenset()):
+        check_cancelled()
         if depth > 30:
             raise RuntimeError("تجاوز مجلد Drive عمق التداخل الآمن (30 مستوى).")
-        if folder_id in visited:
-            return
-        visited.add(folder_id)
+        if folder_id in ancestry:
+            raise RuntimeError("تم اكتشاف حلقة اختصارات داخل مجلدات Google Drive.")
+        branch = ancestry | {folder_id}
         page_token = None
         while True:
-            args = {"q": f"'{folder_id}' in parents and trashed = false", "pageSize": 1000,
-                    "fields": "nextPageToken,files(id,name,mimeType,size,webViewLink)"}
+            check_cancelled()
+            args = {
+                "q": f"'{folder_id}' in parents and trashed = false",
+                "pageSize": 1000,
+                "fields": "nextPageToken,files(id,name,mimeType,size,webViewLink,shortcutDetails)",
+            }
             if page_token:
                 args["pageToken"] = page_token
             response = service.files().list(**args).execute(num_retries=3)
             for child in response.get("files", []):
+                check_cancelled()
+                if len(results) + len(results.failures) >= 1000:
+                    raise RuntimeError("مجلد Drive يتجاوز الحد الآمن البالغ 1000 عنصر.")
                 name = child.get("name") or child.get("id") or "item"
-                rel = str(Path(relative_dir) / name) if relative_dir else name
-                if child.get("mimeType") == "application/vnd.google-apps.folder":
-                    walk(child["id"], rel, depth + 1)
-                else:
-                    if len(results) >= 1000:
-                        raise RuntimeError("مجلد Drive يتجاوز الحد الآمن البالغ 1000 ملف.")
-                    save_file(child, relative_dir)
+                try:
+                    item = resolve_shortcut(child) if child.get("mimeType") == "application/vnd.google-apps.shortcut" else child
+                    if item.get("mimeType") == "application/vnd.google-apps.folder":
+                        walk(item["id"], relative_parts + [name], depth + 1, branch)
+                    else:
+                        save_file(item, relative_parts)
+                except Exception as exc:
+                    if "__CANCELLED__" in str(exc):
+                        raise
+                    fail(child, exc)
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
 
-    item = service.files().get(fileId=file_id, fields="id,name,mimeType,size,webViewLink").execute(num_retries=3)
+    item = service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,size,webViewLink,shortcutDetails",
+    ).execute(num_retries=3)
+    if item.get("mimeType") == "application/vnd.google-apps.shortcut":
+        item = resolve_shortcut(item)
     if item.get("mimeType") == "application/vnd.google-apps.folder":
-        walk(file_id, item.get("name") or "Drive folder")
+        walk(item["id"], [item.get("name") or "Drive folder"])
     else:
-        save_file(item, "")
+        try:
+            save_file(item, [])
+        except Exception as exc:
+            if "__CANCELLED__" in str(exc):
+                raise
+            fail(item, exc)
+
     if not results:
+        if results.failures:
+            first = results.failures[0]
+            raise RuntimeError(
+                f"تعذر تنزيل عناصر Google Drive ({len(results.failures)} فشل). "
+                f"أول خطأ: {first['name']}: {first['error']}"
+            )
         raise RuntimeError("لا توجد ملفات قابلة للتنزيل في عنصر Google Drive هذا.")
     return results
+
 
 
 def is_youtube_url(url):
