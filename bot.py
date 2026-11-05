@@ -1795,7 +1795,7 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                     await youtube_gate()
                 drive_items = None
                 if info and info.get("google_drive"):
-                    drive_items = await asyncio.to_thread(download_google_drive_resource, url, tmp)
+                    drive_items = await asyncio.to_thread(download_google_drive_resource, url, tmp, None, download_progress, cancelled)
                     # A single file follows the standard archive/dedupe/upload path.
                     # Folder contents are uploaded individually into matching nested folders.
                     if len(drive_items) > 1 or Path(drive_items[0][0]).parent != Path(tmp):
@@ -1812,14 +1812,26 @@ async def do_download(update, context, msg, url, quality, info, recovery_parent_
                                 "user_id": uid, "url": url, "name": result["name"],
                                 "drive_file_id": result["id"], "size": result["size"],
                                 "status": "drive_item_completed", "already_exists": result.get("already_exists", False)})
-                        summary = "\\n".join(
+                        summary = "\n".join(
                             f"• {name} — " + ("موجود مسبقًا" if result.get("already_exists") else "تم الرفع")
                             for name, result in results)
+                        drive_failures = getattr(drive_items, "failures", [])
+                        if drive_failures:
+                            summary += "\n\n⚠️ عناصر تم تجاوزها أو تعذر تنزيلها:\n" + "\n".join(
+                                f"• {item['name']}: {item['error']}" for item in drive_failures[:5]
+                            )
+                        final_status = "completed_with_errors" if drive_failures else "completed"
                         persist_task({"task_id": task_id, "recovery_parent_id": recovery_parent_id,
-                            "user_id": uid, "url": url, "status": "completed",
-                            "google_drive_folder": True, "file_count": len(results)})
+                            "user_id": uid, "url": url, "status": final_status,
+                            "google_drive_folder": True, "file_count": len(results),
+                            "failed_count": len(drive_failures)})
+                        status_line = (
+                            f"⚠️ تمت معالجة {len(results)} ملفًا مع {len(drive_failures)} تعذر/تجاوز."
+                            if drive_failures else
+                            f"✅ تمت معالجة {len(results)} ملفًا مع الحفاظ على بنية المجلدات."
+                        )
                         await msg.edit_text(
-                            f"✅ تمت معالجة Google Drive ورفع/تجاوز {len(results)} ملفًا مع الحفاظ على بنية المجلدات.\\n\\n{summary}",
+                            f"{status_line}\n\n{summary}",
                             disable_web_page_preview=True)
                         return
                     file_path = drive_items[0][0]
