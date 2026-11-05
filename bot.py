@@ -518,7 +518,7 @@ def extract_message_urls(message):
             target = getattr(entity, "url", None)
             if target and _valid_http_url(target):
                 positioned.append((begin, target))
-    for match in re.finditer(r"""https?://[^\s<>"']+""", value, re.IGNORECASE):
+        for match in re.finditer(r"""https?://[^\s<>"']+""", value, re.IGNORECASE):
             if any(match.start() < finish and match.end() > begin for begin, finish in hidden_ranges):
                 continue
             candidate = _trim_url_candidate(match.group(0))
